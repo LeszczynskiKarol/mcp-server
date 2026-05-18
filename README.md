@@ -5,6 +5,7 @@
 > Give Claude direct access to your AWS account, SSH into your servers, run shell commands on your laptop, query your databases, and manage PM2 processes — all from a Claude chat. **No Claude Code subscription needed. Your keys never leave your machine.**
 
 ![All 9 tools available as a Claude.ai custom connector](screenshots/connectors.png)
+
 *All 9 tools live in your Claude.ai sidebar - no Desktop install, no separate client, just a custom connector.*
 
 [![CI](https://github.com/LeszczynskiKarol/mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/LeszczynskiKarol/mcp-server/actions/workflows/ci.yml)
@@ -417,7 +418,7 @@ After saving, PM2 (with `--watch`) auto-reloads. **Disconnect and reconnect the 
 | `502 Bad Gateway` | frpc not running or node crashed | Check `pm2 list` and frpc process |
 | `connect EPERM \\.\pipe\rpc.sock` | PM2 daemon corrupted | `rm -rf ~/.pm2 && npm uninstall -g pm2 && npm install -g pm2` |
 | `EADDRINUSE :4500` | Another node running on port 4500 | `Get-Process node \| Stop-Process -Force` in PowerShell as admin |
-| `MCP_PASS - hasło do logowania` at startup | Missing `.env` | `cp .env.example .env` and fill in |
+| `MCP_PASS - OAuth login password` at startup | Missing `.env` | `cp .env.example .env` and fill in |
 | `hosts.json not loaded` | Missing `hosts.json` | `cp hosts.example.json hosts.json` and fill in |
 | `Unknown key 'xxx'` on SSH | Key not defined in `hosts.json` | Add it to the `keys` section |
 | `ssh_exec` returns "Permission denied (publickey)" | Wrong user for the host | In `hosts.json` set the right user (usually `ubuntu` for Ubuntu AMIs, `ec2-user` for Amazon Linux) |
