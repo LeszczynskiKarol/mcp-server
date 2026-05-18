@@ -83,31 +83,31 @@ This project is the **third option**: your own MCP server, your keys, your serve
 
 Real examples from a real Claude.ai chat using this MCP server.
 
-### Check PM2 process health across servers
+### Server health snapshot over SSH
 
-> *"Check the status of all PM2 processes on my panel server and give me a quick health summary"*
+> *"SSH into my matury server and show me: disk usage (df -h), memory usage (free -h), and uptime. Use a single command and present the output nicely."*
 
-![Claude shows PM2 process status with table and health summary](screenshots/1chat.png)
+![Claude composes a server health snapshot with disk, memory and uptime](screenshots/5chat.png)
 
-Claude calls `pm2_status`, formats the output as a clean table, and flags processes worth watching (high restart counts, recent restarts, elevated memory).
+Claude composes a single SSH command, parses the multi-section output, and renders disk, memory and uptime as a clean snapshot with key numbers highlighted.
 
 ### List EC2 instances in any region
 
-> *"Using AWS CLI, list all my EC2 instances in eu-central-1 with their IDs, types, and state"*
+> *"Using AWS CLI, list all my EC2 instances in eu-central-1 with their IDs, types, and state. Format the result as a clean table."*
 
-![EC2 instance inventory rendered as a clean table](screenshots/10chat.png)
+![EC2 instance inventory rendered as a clean table](screenshots/4chat.png)
 
 Claude calls `aws_cli` with a `describe-instances --query ...` filter, then parses the JSON and renders it as a markdown table with running/stopped status indicators.
 
 ### Query PostgreSQL databases over SSH
 
-> *"List all tables in my smart_edu database, then count rows in the 3 biggest ones"*
+> *"Run a SQL query on my 'panel' PostgreSQL database to count the total users, then on database 'smart_edu' count rows in the users table, and tell me how my system is doing."*
 
-![Postgres query call with smart_edu database](screenshots/6chat.png)
+![Claude orchestrates ssh_exec and postgres_query in parallel](screenshots/7chat.webp)
 
 Two tools work together here: `ssh_exec` to enumerate databases when the first guess misses, then `postgres_query` against the right one.
 
-![Database list and user counts across multiple databases](screenshots/3chat.png)
+![Database list and user counts across multiple databases](screenshots/9chat.png)
 
 Claude lists every database on the host, identifies the ones with a `users` table, and runs `COUNT(*)` queries in parallel.
 
