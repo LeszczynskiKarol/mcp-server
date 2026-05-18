@@ -2,7 +2,6 @@
 
 import express from "express";
 import rateLimit from "express-rate-limit";
-import helmet from "helmet";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { exec, execFile } from "child_process";
@@ -43,29 +42,8 @@ const AUTH_CODE_TTL_MS =
   parseInt(process.env.AUTH_CODE_TTL_SECONDS || "600", 10) * 1000;
 const EXEC_BUFFER =
   parseInt(process.env.EXEC_BUFFER_MB || "10", 10) * 1024 * 1024;
-const EXEC_TIMEOUT_MS =
-  parseInt(process.env.EXEC_TIMEOUT_SECONDS || "120", 10) * 1000;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_OWNER = process.env.GITHUB_OWNER || "";
-const ALLOWED_IPS = (process.env.MCP_ALLOWED_IPS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-// Trust proxy can be: "false"/unset (no), "true" (any — INSECURE), "loopback"
-// (127.0.0.1, ::1), or a comma-separated list of trusted proxy IPs/CIDRs.
-const TRUST_PROXY_RAW = process.env.MCP_TRUST_PROXY || "";
-let TRUST_PROXY;
-if (TRUST_PROXY_RAW === "" || TRUST_PROXY_RAW === "false") {
-  TRUST_PROXY = false;
-} else if (TRUST_PROXY_RAW === "true") {
-  TRUST_PROXY = true; // permissive — rate limiter will refuse this
-} else {
-  // Express accepts: "loopback", "linklocal", "uniquelocal", IPs, CIDRs, comma-separated
-  TRUST_PROXY = TRUST_PROXY_RAW;
-}
-const AUTO_ENROLL = process.env.MCP_AUTO_ENROLL !== "false"; // default true
-const ENROLL_TTL_MS =
-  parseInt(process.env.MCP_ENROLL_TTL_SECONDS || "2592000", 10) * 1000;
 
 // Validate required env
 const errors = [];
@@ -85,71 +63,10 @@ console.log(`MCP server: ${SERVER_NAME}`);
 console.log(`Base URL: ${BASE_URL}`);
 console.log(`Port: ${PORT}`);
 console.log(`Token TTL: ${TOKEN_TTL_MS / 1000 / 86400} days`);
-console.log(
-  `Static IP allowlist: ${ALLOWED_IPS.length ? ALLOWED_IPS.join(", ") : "(none)"}`,
-);
-console.log(
-  `Auto-enroll: ${AUTO_ENROLL ? `enabled (TTL ${ENROLL_TTL_MS / 1000 / 86400} days)` : "disabled"}`,
-);
-console.log(`Trust proxy: ${TRUST_PROXY}`);
 
-// === OAuth state persistence ===
-const OAUTH_STATE_FILE =
-  process.env.OAUTH_STATE_FILE || path.join(process.cwd(), "oauth-state.json");
-const CLIENT_TTL_MS =
-  parseInt(process.env.CLIENT_TTL_SECONDS || "7776000", 10) * 1000; // 90 days
-
-function loadOauthState() {
-  try {
-    const raw = fsSync.readFileSync(OAUTH_STATE_FILE, "utf8");
-    const data = JSON.parse(raw);
-    console.log(
-      `[oauth] loaded state: ${Object.keys(data.clients || {}).length} clients, ${Object.keys(data.accessTokens || {}).length} tokens`,
-    );
-    return {
-      clients: new Map(Object.entries(data.clients || {})),
-      authCodes: new Map(Object.entries(data.authCodes || {})),
-      accessTokens: new Map(Object.entries(data.accessTokens || {})),
-      refreshTokens: new Map(Object.entries(data.refreshTokens || {})),
-      dynamicAllowlist: new Map(Object.entries(data.dynamicAllowlist || {})),
-    };
-  } catch (e) {
-    if (e.code !== "ENOENT")
-      console.warn(`[oauth] state load failed: ${e.message}`);
-    return {
-      clients: new Map(),
-      authCodes: new Map(),
-      accessTokens: new Map(),
-      refreshTokens: new Map(),
-      dynamicAllowlist: new Map(),
-    };
-  }
-}
-
-const { clients, authCodes, accessTokens, refreshTokens, dynamicAllowlist } =
-  loadOauthState();
-
-let saveTimer = null;
-function saveOauthState() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    const data = {
-      clients: Object.fromEntries(clients),
-      authCodes: Object.fromEntries(authCodes),
-      accessTokens: Object.fromEntries(accessTokens),
-      refreshTokens: Object.fromEntries(refreshTokens),
-      dynamicAllowlist: Object.fromEntries(dynamicAllowlist),
-    };
-    const tmp = OAUTH_STATE_FILE + ".tmp";
-    try {
-      fsSync.writeFileSync(tmp, JSON.stringify(data, null, 2));
-      fsSync.renameSync(tmp, OAUTH_STATE_FILE);
-    } catch (e) {
-      console.error(`[oauth] state save failed: ${e.message}`);
-    }
-  }, 500).unref();
-}
+const clients = new Map(); // client_id -> { client_secret, redirect_uris }
+const authCodes = new Map(); // code -> { client_id, redirect_uri, expires }
+const accessTokens = new Map(); // access_token -> { client_id, expires }
 
 setInterval(() => {
   const now = Date.now();
@@ -166,36 +83,8 @@ setInterval(() => {
       cleaned++;
     }
   }
-  for (const [k, v] of refreshTokens) {
-    if (v.expires < now) {
-      refreshTokens.delete(k);
-      cleaned++;
-    }
-  }
-  for (const [ip, v] of dynamicAllowlist) {
-    if (v.expires < now) {
-      dynamicAllowlist.delete(ip);
-      cleaned++;
-      console.log(`[allowlist] auto-enrolled IP ${ip} expired and removed`);
-    }
-  }
-  // Clean unused clients (no active tokens, created > CLIENT_TTL_MS ago)
-  const activeClientIds = new Set();
-  for (const v of accessTokens.values()) activeClientIds.add(v.client_id);
-  for (const [k, v] of clients) {
-    if (
-      !activeClientIds.has(k) &&
-      v.created_at &&
-      now - v.created_at > CLIENT_TTL_MS
-    ) {
-      clients.delete(k);
-      cleaned++;
-    }
-  }
-  if (cleaned > 0) {
+  if (cleaned > 0)
     console.log(`[oauth cleanup] removed ${cleaned} expired entries`);
-    saveOauthState();
-  }
 }, 60_000).unref();
 
 const execAsync = promisify(exec);
@@ -233,7 +122,6 @@ server.tool(
     try {
       const { stdout, stderr } = await execAsync(`aws ${command}`, {
         maxBuffer: EXEC_BUFFER,
-        timeout: EXEC_TIMEOUT_MS,
       });
       return {
         content: [{ type: "text", text: stdout || stderr || "(no output)" }],
@@ -272,14 +160,10 @@ server.tool(
           keyPath,
           "-o",
           "StrictHostKeyChecking=no",
-          "-o",
-          "ConnectTimeout=10",
-          "-o",
-          "ServerAliveInterval=30",
           `${user}@${host}`,
           command,
         ],
-        { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
+        { maxBuffer: EXEC_BUFFER },
       );
       const parts = [];
       if (stdout) parts.push(stdout);
@@ -314,8 +198,7 @@ server.tool(
       const { stdout, stderr } = await execAsync(command, {
         maxBuffer: EXEC_BUFFER,
         cwd: cwd || undefined,
-        shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
-        timeout: EXEC_TIMEOUT_MS,
+        shell: "cmd.exe",
       });
       return {
         content: [{ type: "text", text: stdout || stderr || "(no output)" }],
@@ -364,57 +247,17 @@ server.tool(
         isError: true,
       };
 
-    // auto-prefix owner if shortcut form "/repos/repo-name[/sub-resource...]"
-    // Detection: if the second segment after /repos/ is a known GitHub sub-resource,
-    // then the first segment is a repo name (not an owner) and we prepend GITHUB_OWNER.
+    // auto-prefix owner if shortcut form "/repos/repo-name/..."
     let ep = endpoint.startsWith("/") ? endpoint : "/" + endpoint;
-    const KNOWN_SUBRESOURCES = new Set([
-      "issues",
-      "pulls",
-      "commits",
-      "contents",
-      "branches",
-      "tags",
-      "releases",
-      "actions",
-      "workflows",
-      "labels",
-      "milestones",
-      "comments",
-      "events",
-      "collaborators",
-      "deployments",
-      "hooks",
-      "keys",
-      "languages",
-      "stargazers",
-      "subscribers",
-      "topics",
-      "readme",
-      "license",
-      "git",
-      "compare",
-      "statuses",
-      "check-runs",
-      "check-suites",
-      "code-scanning",
-      "secret-scanning",
-      "dependabot",
-      "pages",
-      "vulnerability-alerts",
-      "traffic",
-      "forks",
-      "merges",
-      "import",
-    ]);
-    if (GITHUB_OWNER) {
-      const parts = ep.split("/").filter(Boolean); // [repos, X, Y, ...]
-      if (
-        parts[0] === "repos" &&
-        parts[1] &&
-        (!parts[2] || KNOWN_SUBRESOURCES.has(parts[2]))
-      ) {
-        ep = "/" + ["repos", GITHUB_OWNER, ...parts.slice(1)].join("/");
+    const shortMatch = ep.match(/^\/repos\/([^\/]+)(\/.*)?$/);
+    if (shortMatch && !shortMatch[1].includes("/") && GITHUB_OWNER) {
+      // check if it's already owner/repo (i.e. second slash inside the first segment)
+      const parts = ep.split("/");
+      // /repos/X/Y/... -> parts = ["", "repos", "X", "Y", ...]
+      // if parts[3] exists and looks like a repo name, X is the owner and Y is the repo
+      // if parts[3] is missing or looks like a sub-resource, X is a repo-name shortcut
+      if (parts.length < 4) {
+        ep = `/repos/${GITHUB_OWNER}/${parts[2]}`;
       }
     }
 
@@ -485,10 +328,6 @@ function buildSshArgs(hostKey) {
     resolveKeyPath(h.key),
     "-o",
     "StrictHostKeyChecking=no",
-    "-o",
-    "ConnectTimeout=10",
-    "-o",
-    "ServerAliveInterval=30",
     `${user}@${h.ip}`,
   ];
 }
@@ -518,11 +357,6 @@ server.tool(
   async ({ host, database, query, format }) => {
     try {
       const sshArgs = buildSshArgs(host);
-      if (!/^[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error(
-          `Invalid database name: must match [a-zA-Z0-9_]+, got '${database}'`,
-        );
-      }
       // pass SQL via base64 -> stdin to avoid any shell quoting nightmares
       const sqlB64 = Buffer.from(query, "utf8").toString("base64");
       const fmtFlag =
@@ -809,19 +643,7 @@ server.tool(
           return {
             content: [{ type: "text", text: JSON.stringify(notes, null, 2) }],
           };
-        const keys = key.split(".");
-        if (
-          keys.some((k) =>
-            ["__proto__", "constructor", "prototype"].includes(k),
-          )
-        ) {
-          throw new Error(`Forbidden key segment in '${key}'`);
-        }
-        const val = keys.reduce(
-          (o, k) =>
-            o && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined,
-          notes,
-        );
+        const val = key.split(".").reduce((o, k) => o?.[k], notes);
         return {
           content: [
             { type: "text", text: JSON.stringify(val, null, 2) ?? "null" },
@@ -829,27 +651,11 @@ server.tool(
         };
       }
 
-      const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-      const validatePath = (keys) => {
-        for (const k of keys) {
-          if (FORBIDDEN_KEYS.has(k)) {
-            throw new Error(`Forbidden key segment: '${k}'`);
-          }
-        }
-      };
-
       if (operation === "set") {
         const keys = key.split(".");
-        validatePath(keys);
         let obj = notes;
         for (let i = 0; i < keys.length - 1; i++) {
-          if (
-            !Object.prototype.hasOwnProperty.call(obj, keys[i]) ||
-            typeof obj[keys[i]] !== "object" ||
-            obj[keys[i]] === null
-          ) {
-            obj[keys[i]] = {};
-          }
+          if (!obj[keys[i]]) obj[keys[i]] = {};
           obj = obj[keys[i]];
         }
         obj[keys[keys.length - 1]] = value;
@@ -857,16 +663,9 @@ server.tool(
 
       if (operation === "append") {
         const keys = key.split(".");
-        validatePath(keys);
         let obj = notes;
         for (let i = 0; i < keys.length - 1; i++) {
-          if (
-            !Object.prototype.hasOwnProperty.call(obj, keys[i]) ||
-            typeof obj[keys[i]] !== "object" ||
-            obj[keys[i]] === null
-          ) {
-            obj[keys[i]] = {};
-          }
+          if (!obj[keys[i]]) obj[keys[i]] = {};
           obj = obj[keys[i]];
         }
         const k = keys[keys.length - 1];
@@ -885,93 +684,7 @@ server.tool(
   },
 );
 
-function normalizeIp(ip) {
-  if (!ip) return "";
-  return ip.replace(/^::ffff:/, "");
-}
-
-function ipMatches(clientIp, rule) {
-  const a = normalizeIp(clientIp);
-  const b = normalizeIp(rule);
-  if (a === b) return true;
-  if (rule.includes("/")) {
-    const [range, bitsStr] = rule.split("/");
-    const bits = parseInt(bitsStr, 10);
-    const normRange = normalizeIp(range);
-    if (!a.includes(".") || !normRange.includes(".")) return false; // IPv4 CIDR only
-    const ipToInt = (ip) =>
-      ip.split(".").reduce((acc, oct) => (acc << 8) + parseInt(oct, 10), 0) >>>
-      0;
-    const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
-    return (ipToInt(a) & mask) === (ipToInt(normRange) & mask);
-  }
-  return false;
-}
-
-function ipToSubnet(ip) {
-  // 160.79.106.37 -> 160.79.106.0/24
-  if (!ip.includes(".")) return ip; // IPv6 — store as-is
-  const octets = ip.split(".");
-  if (octets.length !== 4) return ip;
-  return `${octets[0]}.${octets[1]}.${octets[2]}.0/24`;
-}
-
-function enrollIp(req, label) {
-  if (!AUTO_ENROLL) return;
-  const ip = normalizeIp(req.ip || req.connection?.remoteAddress || "");
-  if (!ip) {
-    console.log(`[allowlist] enroll skipped (${label}): no IP detected`);
-    return;
-  }
-  // Don't re-enroll if static rule already covers it
-  if (ALLOWED_IPS.some((rule) => ipMatches(ip, rule))) {
-    console.log(`[allowlist] enroll skipped (${label}): ${ip} matches static`);
-    return;
-  }
-  // Enroll the whole /24 subnet. Claude.ai (and many cloud egresses) rotate
-  // source IPs within a /24, so enrolling a single /32 makes the very next
-  // request fail. /24 = 256 IPs, acceptable trade-off for personal use.
-  const subnet = ipToSubnet(ip);
-  // Already covered by another dynamic entry?
-  if (dynamicAllowlist.has(subnet)) {
-    const existing = dynamicAllowlist.get(subnet);
-    if (existing.expires > Date.now()) {
-      // Refresh TTL
-      existing.expires = Date.now() + ENROLL_TTL_MS;
-      saveOauthState();
-      console.log(`[allowlist] refreshed ${subnet} via ${label}`);
-      return;
-    }
-  }
-  dynamicAllowlist.set(subnet, {
-    expires: Date.now() + ENROLL_TTL_MS,
-    enrolled_at: Date.now(),
-    via: label,
-    source_ip: ip,
-  });
-  saveOauthState();
-  console.log(
-    `[allowlist] enrolled subnet ${subnet} (from ${ip}) via ${label} (TTL ${ENROLL_TTL_MS / 1000 / 86400}d)`,
-  );
-}
-
-function isIpAllowed(req) {
-  const ip = normalizeIp(req.ip || req.connection?.remoteAddress || "");
-  if (!ip) return false;
-  if (ALLOWED_IPS.some((rule) => ipMatches(ip, rule))) return true;
-  // Iterate dynamicAllowlist — entries are CIDR ranges, not single IPs
-  for (const [rule, data] of dynamicAllowlist) {
-    if (data.expires <= Date.now()) continue;
-    if (ipMatches(ip, rule)) return true;
-  }
-  return false;
-}
-
 const app = express();
-if (TRUST_PROXY !== false) {
-  app.set("trust proxy", TRUST_PROXY);
-  console.log(`[trust proxy] set to: ${JSON.stringify(TRUST_PROXY)}`);
-}
 app.use(express.json({ limit: "50mb" }));
 
 // Log wszystkich requestów do OAuth/MCP
@@ -1013,38 +726,8 @@ app.use((req, res, next) => {
 
 app.use("/oauth/token", oauthLimiter);
 app.use("/oauth/authorize", oauthLimiter);
-app.use("/oauth/revoke", oauthLimiter);
-
-// Anti-clickjacking on the login form: deny framing entirely.
-// frameguard only — full helmet defaults add headers that can break the form
-// (HSTS over HTTP if local, CSP that blocks inline styles, etc.)
-app.use(
-  "/oauth/authorize",
-  helmet.frameguard({ action: "deny" }),
-  helmet.contentSecurityPolicy({
-    useDefaults: false,
-    directives: {
-      defaultSrc: ["'self'"],
-      styleSrc: ["'unsafe-inline'"], // login form uses inline style attrs
-      frameAncestors: ["'none'"],
-    },
-    dangerouslyDisableDefaultSrc: false,
-  }),
-);
 
 const mcpHandler = async (req, res) => {
-  // IP allowlist gate — applies to /mcp only.
-  // Returns 401 (not 403) with WWW-Authenticate so the OAuth client re-runs the
-  // login flow, which will auto-enroll the new IP.
-  if (!isIpAllowed(req)) {
-    const ip = normalizeIp(req.ip || req.connection?.remoteAddress || "");
-    console.log(`[allowlist] BLOCKED /mcp from ${ip} (not on list)`);
-    res.set(
-      "WWW-Authenticate",
-      `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`,
-    );
-    return res.status(401).end();
-  }
   const auth = req.headers.authorization || "";
   const bearer = auth.replace(/^Bearer\s+/, "");
   const tokenData = accessTokens.get(bearer);
@@ -1076,12 +759,10 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
     authorization_endpoint: `${BASE_URL}/oauth/authorize`,
     token_endpoint: `${BASE_URL}/oauth/token`,
     registration_endpoint: `${BASE_URL}/oauth/register`,
-    revocation_endpoint: `${BASE_URL}/oauth/revoke`,
     response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code", "refresh_token"],
+    grant_types_supported: ["authorization_code"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
-    revocation_endpoint_auth_methods_supported: ["client_secret_post"],
   });
 });
 
@@ -1100,12 +781,7 @@ app.post("/oauth/register", (req, res) => {
   clients.set(client_id, {
     client_secret,
     redirect_uris: req.body.redirect_uris || [],
-    token_endpoint_auth_method:
-      req.body.token_endpoint_auth_method || "client_secret_post",
-    created_at: Date.now(),
   });
-  saveOauthState();
-
   res.status(201).json({
     client_id,
     client_secret,
@@ -1188,15 +864,12 @@ app.post(
       !safeCompare(username, OAUTH_USER) ||
       !safeCompare(password, OAUTH_PASS)
     ) {
-      const ip = normalizeIp(req.ip || req.connection?.remoteAddress || "");
-      console.log(`[auth] FAIL login from ${ip} user='${username}'`);
       return res
         .status(401)
         .send(
           "Invalid credentials. <a href='javascript:history.back()'>Back</a>",
         );
     }
-    enrollIp(req, "oauth_login");
     const code = crypto.randomBytes(24).toString("hex");
     authCodes.set(code, {
       client_id,
@@ -1205,8 +878,6 @@ app.post(
       code_challenge_method,
       expires: Date.now() + AUTH_CODE_TTL_MS,
     });
-    saveOauthState();
-
     const url = new URL(redirect_uri);
     url.searchParams.set("code", code);
     if (state) url.searchParams.set("state", state);
@@ -1217,73 +888,23 @@ app.post(
 // Token - wymiana code na access_token
 app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
   const { grant_type, code, client_id, code_verifier } = req.body;
-  const provided_client_secret = req.body.client_secret;
   console.log("  TOKEN req:", {
     grant_type,
     code: code ? `${code.slice(0, 8)}...` : undefined,
     client_id,
     code_verifier: code_verifier ? "[REDACTED]" : undefined,
-    client_secret: provided_client_secret ? "[REDACTED]" : undefined,
   });
-
-  // Authenticate client (if it has a secret stored, it MUST present it)
-  const clientRecord = clients.get(client_id);
-  if (!clientRecord) {
-    console.log("  -> FAIL: unknown client_id:", client_id);
-    return res.status(401).json({ error: "invalid_client" });
-  }
-  if (clientRecord.client_secret) {
-    if (
-      !provided_client_secret ||
-      !safeCompare(provided_client_secret, clientRecord.client_secret)
-    ) {
-      console.log("  -> FAIL: bad client_secret for client:", client_id);
-      return res.status(401).json({ error: "invalid_client" });
-    }
-  }
 
   // Obsługa refresh_token grant
   if (grant_type === "refresh_token") {
     const { refresh_token: rt } = req.body;
     console.log("  REFRESH for token:", rt?.slice(0, 8));
-    if (!rt) {
-      console.log("  -> FAIL: missing refresh_token");
-      return res.status(400).json({ error: "invalid_request" });
-    }
-    const rtData = refreshTokens.get(rt);
-    if (!rtData || rtData.expires < Date.now()) {
-      console.log(
-        "  -> FAIL: invalid refresh_token (exists?",
-        !!rtData,
-        "expired?",
-        rtData?.expires < Date.now(),
-        ")",
-      );
-      return res.status(400).json({ error: "invalid_grant" });
-    }
-    if (rtData.client_id !== client_id) {
-      console.log(
-        "  -> FAIL: refresh_token client_id mismatch. token=",
-        rtData.client_id,
-        "req=",
-        client_id,
-      );
-      return res.status(400).json({ error: "invalid_grant" });
-    }
-    // Rotacja: stary refresh_token invalidujemy
-    refreshTokens.delete(rt);
     const new_at = crypto.randomBytes(32).toString("hex");
     const new_rt = crypto.randomBytes(32).toString("hex");
     accessTokens.set(new_at, {
       client_id,
       expires: Date.now() + TOKEN_TTL_MS,
     });
-    refreshTokens.set(new_rt, {
-      client_id,
-      expires: Date.now() + TOKEN_TTL_MS,
-    });
-    saveOauthState();
-
     const refResp = {
       access_token: new_at,
       token_type: "Bearer",
@@ -1308,16 +929,6 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
       codeData?.expires < Date.now(),
       ")",
     );
-    return res.status(400).json({ error: "invalid_grant" });
-  }
-  if (codeData.client_id !== client_id) {
-    console.log(
-      "  -> FAIL: code client_id mismatch. code=",
-      codeData.client_id,
-      "req=",
-      client_id,
-    );
-    authCodes.delete(code); // jednorazowy kod — invalidujemy
     return res.status(400).json({ error: "invalid_grant" });
   }
 
@@ -1358,13 +969,6 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
     client_id,
     expires: Date.now() + TOKEN_TTL_MS, // 30 days by default
   });
-  refreshTokens.set(refresh_token, {
-    client_id,
-    expires: Date.now() + TOKEN_TTL_MS,
-  });
-  enrollIp(req, "token_exchange");
-  saveOauthState();
-
   const response = {
     access_token,
     token_type: "Bearer",
@@ -1381,98 +985,4 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
   res.json(response);
 });
 
-// RFC 7009 - Token Revocation
-// Client authenticates (same as /oauth/token), then sends:
-//   token=<the_token>
-//   token_type_hint=access_token|refresh_token  (optional)
-// Always returns 200 unless client auth fails, even if the token doesn't exist
-// (RFC requirement — don't leak whether a token was valid).
-app.post(
-  "/oauth/revoke",
-  express.urlencoded({ extended: true }),
-  (req, res) => {
-    const { token, token_type_hint, client_id } = req.body;
-    const provided_client_secret = req.body.client_secret;
-    console.log("  REVOKE req:", {
-      token: token ? `${token.slice(0, 8)}...` : undefined,
-      token_type_hint,
-      client_id,
-      client_secret: provided_client_secret ? "[REDACTED]" : undefined,
-    });
-
-    // Client authentication (same rules as /oauth/token)
-    const clientRecord = clients.get(client_id);
-    if (!clientRecord) {
-      console.log("  -> FAIL: unknown client_id:", client_id);
-      return res.status(401).json({ error: "invalid_client" });
-    }
-    if (clientRecord.client_secret) {
-      if (
-        !provided_client_secret ||
-        !safeCompare(provided_client_secret, clientRecord.client_secret)
-      ) {
-        console.log("  -> FAIL: bad client_secret for client:", client_id);
-        return res.status(401).json({ error: "invalid_client" });
-      }
-    }
-
-    if (!token) {
-      // RFC: missing token is a 200 anyway (idempotent revoke)
-      return res.status(200).end();
-    }
-
-    // Look up token. token_type_hint is optimization only — we check both maps.
-    const order =
-      token_type_hint === "refresh_token"
-        ? ["refresh", "access"]
-        : ["access", "refresh"];
-    let revoked = false;
-    for (const kind of order) {
-      const map = kind === "access" ? accessTokens : refreshTokens;
-      const data = map.get(token);
-      if (!data) continue;
-      // Only the owning client can revoke
-      if (data.client_id !== client_id) {
-        console.log(
-          `  -> FAIL: ${kind}_token belongs to ${data.client_id}, request from ${client_id}`,
-        );
-        // RFC says still respond 200 to avoid leaking info, but log it.
-        break;
-      }
-      map.delete(token);
-      revoked = true;
-      console.log(`  REVOKED ${kind}_token for client ${client_id}`);
-      break;
-    }
-
-    if (revoked) saveOauthState();
-    else console.log("  (no matching token found — 200 anyway per RFC 7009)");
-
-    res.status(200).end();
-  },
-);
-
-const httpServer = app.listen(PORT, () =>
-  console.log(`MCP listening on :${PORT}`),
-);
-
-function shutdown(signal) {
-  console.log(`\n[${signal}] graceful shutdown...`);
-  httpServer.close(() => {
-    // Flush pending state save
-    if (saveTimer) {
-      clearTimeout(saveTimer);
-      saveTimer = null;
-      saveOauthState();
-    }
-    console.log("[shutdown] done");
-    process.exit(0);
-  });
-  // Force exit after 10s if connections hang
-  setTimeout(() => {
-    console.error("[shutdown] forced exit");
-    process.exit(1);
-  }, 10000).unref();
-}
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+app.listen(PORT, () => console.log(`MCP listening on :${PORT}`));

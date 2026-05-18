@@ -7,32 +7,8 @@ node_modules/
 .env.*.local
 hosts.json
 
-# PM2
-dump.pm2
-.pm2/
-ecosystem.config.js
-
-# Logs
-*.log
+mcp-task.generated.xml
+start-mcp-hidden.vbs
+mcp-task.xml
 logs/
-npm-debug.log*
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Build artifacts
-dist/
-build/
-
-# Temporary files
-*.tmp
-*.bak
-.tmp_*
+oauth-state.json
