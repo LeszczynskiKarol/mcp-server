@@ -165,11 +165,25 @@ Powinieneś dostać odpowiedź JSON-RPC (np. `406 Not Acceptable` z wymogiem `te
 
 ## Bezpieczeństwo
 
-⚠️ **Server nie ma autoryzacji.** Każdy, kto trafi na URL, może wywoływać `aws_cli` i `ssh_exec`. Ochronę zapewnia:
+Server wymaga **autoryzacji hasłem przez OAuth 2.1** (PKCE + Dynamic Client Registration). Claude.ai przy łączeniu otwiera login form, gdzie trzeba podać dane skonfigurowane w `server.js`:
 
-- Trudność zgadnięcia subdomeny
-- Brak indeksowania
-- Restrykcje sieciowe (ostatecznie można dorzucić basic auth w nginx)
+```javascript
+const OAUTH_USER = "admin";
+const OAUTH_PASS = "twoje-haslo";
+```
+
+Po zalogowaniu Claude dostaje access token (30 dni ważności) i dopiero z nim ma dostęp do tooli. Bez tokena każde `/mcp` zwraca `401 Unauthorized` z nagłówkiem `WWW-Authenticate` wskazującym na endpoint OAuth discovery.
+
+Klucze `.pem` i tak nigdy nie opuszczają Twojej maszyny — tunel przenosi tylko żądania MCP.
+
+**Dodatkowe zalecenia produkcyjne:**
+
+1. **Hasło z env**, nie hardcoded — wczytuj z `process.env.MCP_PASS`
+2. **Whitelist komend** — w `aws_cli` ogranicz do `describe-*` / `list-*`, jeśli nie potrzebujesz mutacji
+3. **Read-only AWS profile** — utwórz osobne IAM credentials tylko do odczytu i ustaw `AWS_PROFILE` przed odpaleniem node'a
+4. **SSH known_hosts** — usuń `StrictHostKeyChecking=no` i dodaj hosty raz ręcznie do `~/.ssh/known_hosts`
+5. **Loguj każdy tool call** do osobnego pliku — audyt + debug
+6. **Persist OAuth state** — obecnie `clients` i `accessTokens` są w pamięci, po restarcie node'a trzeba ponownie się autoryzować w Claude.ai
 
 **Zalecenia produkcyjne:**
 
@@ -195,13 +209,22 @@ pm2 save
 
 ### Tunel FRP przez Task Scheduler
 
-`D:\frp\start-mcp.bat`:
+`C:\Users\Admin\frp\frp_0.61.1_windows_amd64\start-mcp.bat`:
 
 ```bat
 @echo off
 cd /d C:\Users\Admin\frp\frp_0.61.1_windows_amd64
 start "" /min frpc.exe -c frpc-mcp.toml
 ```
+
+Task Scheduler → Create Task:
+
+- **General**: Run whether user is logged on or not, highest privileges
+- **Trigger**: At startup
+- **Action**: Program = `C:\Users\Admin\frp\frp_0.61.1_windows_amd64\start-mcp.bat`
+- **Settings**: Restart on failure (1 min, 3 razy)
+
+> Ten bat odpala **tylko tunel mcp** — niezależnie od głównego `tunnel` (który nadpisuje `frpc.toml` i służy do frontend/backend). Oba procesy frpc chodzą równolegle, bez kolizji.
 
 Task Scheduler → Create Task:
 
