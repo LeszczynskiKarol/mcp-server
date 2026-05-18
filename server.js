@@ -188,6 +188,117 @@ server.tool(
   },
 );
 
+// Mapowanie hostów - rozszerz wg potrzeb
+const HOSTS = {
+  panel: { ip: "3.67.113.111", user: "ubuntu", key: "maturapolski" },
+  matury: { ip: "3.68.187.152", user: "ubuntu", key: "maturapolski" },
+};
+
+function buildSsh(hostKey) {
+  const h = HOSTS[hostKey];
+  if (!h)
+    throw new Error(
+      `Nieznany host '${hostKey}'. Dostępne: ${Object.keys(HOSTS).join(", ")}`,
+    );
+  const keyPath =
+    h.key === "maturapolski"
+      ? "D:\\maturapolski\\maturapolski-key.pem"
+      : "D:\\maturapolski\\moja-aplikacja-key-pair.pem";
+  return `ssh -i "${keyPath}" -o StrictHostKeyChecking=no ${h.user}@${h.ip}`;
+}
+
+server.tool(
+  "postgres_query",
+  "Wykonuje zapytanie SQL na bazie PostgreSQL przez SSH na konkretnym serwerze. Host: 'panel' (panel.torweb.pl, 3.67.113.111). Używa psql przez sudo -u postgres, więc bez hasła. SELECT zwraca dane, inne komendy DML/DDL też działają (UWAGA: produkcja, nie testuj).",
+  {
+    host: z
+      .enum(["panel", "matury"])
+      .describe("który serwer - panel albo matury"),
+    database: z
+      .string()
+      .describe("nazwa bazy, np. 'maturapolski' albo 'panel_torweb'"),
+    query: z
+      .string()
+      .describe(
+        "zapytanie SQL, np. \"SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '1 day'\"",
+      ),
+    format: z
+      .enum(["table", "csv", "json"])
+      .default("table")
+      .describe("format outputu psql"),
+  },
+  async ({ host, database, query, format }) => {
+    try {
+      const ssh = buildSsh(host);
+      // Escape pojedynczych cudzysłowów w SQL dla shella
+      const sqlEscaped = query.replace(/'/g, "'\\''");
+      // Format flagi psql
+      const fmtFlag =
+        format === "csv" ? "--csv" : format === "json" ? "-A -t" : "";
+      // psql przez sudo -u postgres -d <db> -c '<query>'
+      const cmd = `${ssh} "sudo -u postgres psql -d ${database} ${fmtFlag} -c '${sqlEscaped}'"`;
+      const { stdout, stderr } = await execAsync(cmd, {
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      const out = stdout || stderr || "(no output)";
+      return { content: [{ type: "text", text: out }] };
+    } catch (e) {
+      return {
+        content: [
+          { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "pm2_status",
+  "Pokazuje status pm2 (lista procesów + opcjonalnie ostatnie logi) na wybranym serwerze EC2. Użyj do szybkiej diagnozy: 'pm2_status host=panel' albo z logami 'pm2_status host=matury app=mojaapka lines=100'.",
+  {
+    host: z.enum(["panel", "matury"]).describe("który serwer"),
+    app: z
+      .string()
+      .optional()
+      .describe(
+        "nazwa konkretnej aplikacji pm2 (jeśli chcesz logi tylko jej). Bez tego = tylko lista procesów.",
+      ),
+    lines: z
+      .number()
+      .int()
+      .min(0)
+      .max(500)
+      .default(0)
+      .describe("ile linii logów. 0 = bez logów (tylko lista)"),
+  },
+  async ({ host, app, lines }) => {
+    try {
+      const ssh = buildSsh(host);
+      const parts = [`${ssh} "pm2 list"`];
+      if (lines > 0) {
+        const target = app ? app : "all";
+        parts.push(`${ssh} "pm2 logs ${target} --lines ${lines} --nostream"`);
+      }
+      const outputs = [];
+      for (const cmd of parts) {
+        const { stdout, stderr } = await execAsync(cmd, {
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        outputs.push(stdout || stderr || "(no output)");
+      }
+      return { content: [{ type: "text", text: outputs.join("\n\n---\n\n") }] };
+    } catch (e) {
+      return {
+        content: [
+          { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
 const app = express();
 app.use(express.json());
 
