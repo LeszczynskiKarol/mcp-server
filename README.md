@@ -456,7 +456,7 @@ mcp-server/
 | MCP Client | Status |
 |------------|--------|
 | Claude.ai (web) | ✅ Primary target — fully tested |
-| Claude Desktop | ⚠️ Should work with the same connector URL, untested |
+| Claude Desktop | ✅ Tested - same connector URL works (custom connectors with OAuth) |
 | Custom MCP client (with OAuth 2.1) | ✅ Standard implementation |
 | Custom MCP client (without OAuth) | ❌ Requires modification — OAuth is mandatory in current code |
 
