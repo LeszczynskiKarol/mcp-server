@@ -59,10 +59,21 @@ npm install
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "express": "^4.21.0",
-    "zod": "^3.24.0"
+    "zod": "^3.24.0",
+    "dotenv": "^17.0.0"
   }
 }
 ```
+
+Utwórz plik `.env` w katalogu projektu:
+
+```env
+MCP_USER=admin
+MCP_PASS=twoje-haslo
+MCP_BASE_URL=https://mcp.torweb.pl
+```
+
+⚠️ Dodaj `.env` do `.gitignore`, żeby nie wypchnąć hasła do repo.
 
 ---
 
@@ -165,11 +176,11 @@ Powinieneś dostać odpowiedź JSON-RPC (np. `406 Not Acceptable` z wymogiem `te
 
 ## Bezpieczeństwo
 
-Server wymaga **autoryzacji hasłem przez OAuth 2.1** (PKCE + Dynamic Client Registration). Claude.ai przy łączeniu otwiera login form, gdzie trzeba podać dane skonfigurowane w `server.js`:
+Server wymaga **autoryzacji hasłem przez OAuth 2.1** (PKCE + Dynamic Client Registration). Claude.ai przy łączeniu otwiera login form, gdzie trzeba podać dane skonfigurowane w `.env`:
 
-```javascript
-const OAUTH_USER = "admin";
-const OAUTH_PASS = "twoje-haslo";
+```env
+MCP_USER=admin
+MCP_PASS=twoje-haslo
 ```
 
 Po zalogowaniu Claude dostaje access token (30 dni ważności) i dopiero z nim ma dostęp do tooli. Bez tokena każde `/mcp` zwraca `401 Unauthorized` z nagłówkiem `WWW-Authenticate` wskazującym na endpoint OAuth discovery.
@@ -178,12 +189,11 @@ Klucze `.pem` i tak nigdy nie opuszczają Twojej maszyny — tunel przenosi tylk
 
 **Dodatkowe zalecenia produkcyjne:**
 
-1. **Hasło z env**, nie hardcoded — wczytuj z `process.env.MCP_PASS`
-2. **Whitelist komend** — w `aws_cli` ogranicz do `describe-*` / `list-*`, jeśli nie potrzebujesz mutacji
-3. **Read-only AWS profile** — utwórz osobne IAM credentials tylko do odczytu i ustaw `AWS_PROFILE` przed odpaleniem node'a
-4. **SSH known_hosts** — usuń `StrictHostKeyChecking=no` i dodaj hosty raz ręcznie do `~/.ssh/known_hosts`
-5. **Loguj każdy tool call** do osobnego pliku — audyt + debug
-6. **Persist OAuth state** — obecnie `clients` i `accessTokens` są w pamięci, po restarcie node'a trzeba ponownie się autoryzować w Claude.ai
+1. **Whitelist komend** — w `aws_cli` ogranicz do `describe-*` / `list-*`, jeśli nie potrzebujesz mutacji
+2. **Read-only AWS profile** — utwórz osobne IAM credentials tylko do odczytu i ustaw `AWS_PROFILE` przed odpaleniem node'a
+3. **SSH known_hosts** — usuń `StrictHostKeyChecking=no` i dodaj hosty raz ręcznie do `~/.ssh/known_hosts`
+4. **Loguj każdy tool call** do osobnego pliku — audyt + debug
+5. **Persist OAuth state** — obecnie `clients` i `accessTokens` są w pamięci, po restarcie node'a trzeba ponownie się autoryzować w Claude.ai
 
 **Zalecenia produkcyjne:**
 
@@ -272,9 +282,11 @@ Po dodaniu — restart node, **disconnect/connect connector w Claude.ai** żeby 
 ## Pliki w projekcie
 
 ```
-D:\mcp-server\
+D:\mcp-server
 ├── server.js         # MCP server (Express + StreamableHTTP transport)
 ├── package.json
-├── node_modules\
+├── .env              # MCP_USER, MCP_PASS, MCP_BASE_URL (nie commitować!)
+├── .gitignore
+├── node_modules
 └── frpc-mcp.toml     # osobny config tunela dla mcp (port 4500 → mcp.torweb.pl)
 ```
