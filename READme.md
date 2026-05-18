@@ -1,4 +1,4 @@
-# MCP Server — AWS CLI + SSH + Local + GitHub
+# MCP Server — AWS CLI + SSH + Local + GitHub + Postgres + PM2
 
 Lokalny MCP server, który daje Claude.ai (lub innemu klientowi MCP) bezpośredni dostęp do **AWS CLI**, **SSH na instancje EC2 przez klucze .pem**, **lokalnego shella Windows** oraz **GitHub REST API** — bez kopiowania promptów i bez Claude Code.
 
@@ -32,6 +32,8 @@ Wystawia cztery narzędzia MCP, których Claude może użyć w czacie:
 - **`ssh_exec`** — wykonuje polecenie po SSH na wskazanym hoście, używając jednego z dwóch kluczy `.pem` (`maturapolski` lub `moja-aplikacja`)
 - **`local_exec`** — wykonuje dowolne polecenie shell (`cmd.exe`) na lokalnym Windowsie. Edycja plików, git, npm, pm2 lokalny, dowolny soft.
 - **`github_api`** — wykonuje request do GitHub REST API używając Personal Access Token. Issues, PRs, commits, contents, workflows.
+- **`postgres_query`** — wykonuje zapytanie SQL na bazie PostgreSQL przez SSH (`sudo -u postgres psql`). Działa na zdefiniowanych hostach (`panel`, `matury`), bez hasła do bazy.
+- **`pm2_status`** — pokazuje `pm2 list` i opcjonalnie ostatnie logi (`pm2 logs --nostream`) na wskazanym serwerze. Szybka diagnoza bez wchodzenia ręcznie po SSH.
 
 Klucze `.pem` i GitHub PAT **nigdy nie opuszczają Twojej maszyny**. Tunel przenosi tylko żądania MCP (komendy do wykonania) i ich wyniki.
 
@@ -243,6 +245,22 @@ Jak używasz PM2, w `start-mcp.bat` usuń drugą część (`cd /d D:\mcp-server 
 
 ## Rozszerzanie
 
+### Dodawanie kolejnego serwera
+
+W `server.js` znajdź obiekt `HOSTS` i dorzuć nowy wpis:
+
+```javascript
+const HOSTS = {
+  panel: { ip: "3.67.113.111", user: "ubuntu", key: "maturapolski" },
+  matury: { ip: "3.68.187.152", user: "ubuntu", key: "maturapolski" },
+  nowy: { ip: "1.2.3.4", user: "ubuntu", key: "moja-aplikacja" },
+};
+```
+
+Po tym `postgres_query` i `pm2_status` automatycznie obsłużą alias `nowy`.
+
+### Dodawanie nowego toola
+
 Każdy nowy tool to kilka linii w `server.js`:
 
 ```javascript
@@ -297,6 +315,18 @@ Po dodaniu — restart node, **disconnect/connect connector w Claude.ai** żeby 
 - _"Wylistuj otwarte issue w repo maturapolski"_
 - _"Pokaż commits w main z ostatniego tygodnia"_
 - _"Utwórz nowego brancha `fix/login-bug` z aktualnego maina"_
+
+**Postgres bez logowania do bazy:**
+
+- _"Ile użytkowników zarejestrowało się dzisiaj w maturapolski?"_ → `postgres_query host=panel database=maturapolski query="SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '1 day'"`
+- _"Pokaż 10 ostatnich błędów płatności w bazie panel_torweb"_
+- _"Jaka jest wielkość tabeli `arkusze` w bazie maturapolski?"_
+
+**PM2 - szybka diagnoza:**
+
+- _"Co działa na panel.torweb.pl?"_ → `pm2_status host=panel`
+- _"Pokaż ostatnie 100 linii logów aplikacji `maturapolski-api` na serwerze panel"_ → `pm2_status host=panel app=maturapolski-api lines=100`
+- _"Sprawdź czy wszystkie procesy pm2 są w stanie 'online' na obu serwerach"_
 
 **End-to-end (4 narzędzia naraz):**
 
