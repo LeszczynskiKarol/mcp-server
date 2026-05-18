@@ -1,9 +1,10 @@
 // server.js
 
 import express from "express";
+import rateLimit from "express-rate-limit";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { exec } from "child_process";
+import { exec, execFile } from "child_process";
 import { promisify } from "util";
 import { z } from "zod";
 import crypto from "crypto";
@@ -67,7 +68,43 @@ const clients = new Map(); // client_id -> { client_secret, redirect_uris }
 const authCodes = new Map(); // code -> { client_id, redirect_uri, expires }
 const accessTokens = new Map(); // access_token -> { client_id, expires }
 
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [k, v] of authCodes) {
+    if (v.expires < now) {
+      authCodes.delete(k);
+      cleaned++;
+    }
+  }
+  for (const [k, v] of accessTokens) {
+    if (v.expires < now) {
+      accessTokens.delete(k);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0)
+    console.log(`[oauth cleanup] removed ${cleaned} expired entries`);
+}, 60_000).unref();
+
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+function safeCompare(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+const oauthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "too_many_requests" },
+});
 
 const server = new McpServer({ name: SERVER_NAME, version: "1.0.0" });
 
@@ -82,10 +119,21 @@ server.tool(
       ),
   },
   async ({ command }) => {
-    const { stdout, stderr } = await execAsync(`aws ${command}`, {
-      maxBuffer: EXEC_BUFFER,
-    });
-    return { content: [{ type: "text", text: stdout || stderr }] };
+    try {
+      const { stdout, stderr } = await execAsync(`aws ${command}`, {
+        maxBuffer: EXEC_BUFFER,
+      });
+      return {
+        content: [{ type: "text", text: stdout || stderr || "(no output)" }],
+      };
+    } catch (e) {
+      return {
+        content: [
+          { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+        ],
+        isError: true,
+      };
+    }
   },
 );
 
@@ -105,11 +153,24 @@ server.tool(
   async ({ key, user, host, command }) => {
     try {
       const keyPath = resolveKeyPath(key);
-      const { stdout, stderr } = await execAsync(
-        `ssh -i "${keyPath}" -o StrictHostKeyChecking=no ${user}@${host} "${command.replace(/"/g, '\\"')}"`,
+      const { stdout, stderr } = await execFileAsync(
+        "ssh",
+        [
+          "-i",
+          keyPath,
+          "-o",
+          "StrictHostKeyChecking=no",
+          `${user}@${host}`,
+          command,
+        ],
         { maxBuffer: EXEC_BUFFER },
       );
-      return { content: [{ type: "text", text: stdout || stderr }] };
+      const parts = [];
+      if (stdout) parts.push(stdout);
+      if (stderr) parts.push(`--- stderr ---\n${stderr}`);
+      return {
+        content: [{ type: "text", text: parts.join("\n") || "(no output)" }],
+      };
     } catch (e) {
       return {
         content: [
@@ -255,14 +316,20 @@ function resolveKeyPath(keyName) {
   return path.normalize(resolved);
 }
 
-function buildSsh(hostKey) {
+function buildSshArgs(hostKey) {
   const h = (HOSTS_CONFIG.hosts || {})[hostKey];
   if (!h)
     throw new Error(
       `Unknown host '${hostKey}'. Available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(hosts.json not loaded)"}`,
     );
   const user = h.user || "ubuntu";
-  return `ssh -i "${resolveKeyPath(h.key)}" -o StrictHostKeyChecking=no ${user}@${h.ip}`;
+  return [
+    "-i",
+    resolveKeyPath(h.key),
+    "-o",
+    "StrictHostKeyChecking=no",
+    `${user}@${h.ip}`,
+  ];
 }
 
 server.tool(
@@ -289,19 +356,23 @@ server.tool(
   },
   async ({ host, database, query, format }) => {
     try {
-      const ssh = buildSsh(host);
-      // Escape pojedynczych cudzysłowów w SQL dla shella
-      const sqlEscaped = query.replace(/'/g, "'\\''");
-      // Format flagi psql
+      const sshArgs = buildSshArgs(host);
+      // pass SQL via base64 -> stdin to avoid any shell quoting nightmares
+      const sqlB64 = Buffer.from(query, "utf8").toString("base64");
       const fmtFlag =
         format === "csv" ? "--csv" : format === "json" ? "-A -t" : "";
-      // psql przez sudo -u postgres -d <db> -c '<query>'
-      const cmd = `${ssh} "cd /tmp && sudo -u postgres psql -d ${database} ${fmtFlag} -c '${sqlEscaped}'"`;
-      const { stdout, stderr } = await execAsync(cmd, {
-        maxBuffer: EXEC_BUFFER,
-      });
-      const out = stdout || stderr || "(no output)";
-      return { content: [{ type: "text", text: out }] };
+      const remoteCmd = `cd /tmp && echo ${sqlB64} | base64 -d | sudo -u postgres psql -d ${database} ${fmtFlag}`;
+      const { stdout, stderr } = await execFileAsync(
+        "ssh",
+        [...sshArgs, remoteCmd],
+        { maxBuffer: EXEC_BUFFER },
+      );
+      const parts = [];
+      if (stdout) parts.push(stdout);
+      if (stderr) parts.push(`--- stderr ---\n${stderr}`);
+      return {
+        content: [{ type: "text", text: parts.join("\n") || "(no output)" }],
+      };
     } catch (e) {
       return {
         content: [
@@ -338,9 +409,8 @@ server.tool(
   },
   async ({ host, app, lines }) => {
     try {
-      const ssh = buildSsh(host);
-      // Explicitly source nvm.sh because .bashrc has an early return for non-interactive shells
-      const wrap = (cmd) => {
+      const sshArgs = buildSshArgs(host);
+      const buildRemote = (cmd) => {
         const script = [
           'export NVM_DIR="$HOME/.nvm"',
           '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"',
@@ -348,20 +418,26 @@ server.tool(
           cmd,
         ].join("\n");
         const b64 = Buffer.from(script).toString("base64");
-        return `${ssh} "echo ${b64} | base64 -d | bash"`;
+        return `echo ${b64} | base64 -d | bash`;
       };
-
-      const parts = [wrap("pm2 list")];
+      const remoteCmds = [buildRemote("pm2 list")];
       if (lines > 0) {
         const target = app ? app : "all";
-        parts.push(wrap(`pm2 logs ${target} --lines ${lines} --nostream`));
+        remoteCmds.push(
+          buildRemote(`pm2 logs ${target} --lines ${lines} --nostream`),
+        );
       }
       const outputs = [];
-      for (const cmd of parts) {
-        const { stdout, stderr } = await execAsync(cmd, {
-          maxBuffer: EXEC_BUFFER,
-        });
-        outputs.push(stdout || stderr || "(no output)");
+      for (const rc of remoteCmds) {
+        const { stdout, stderr } = await execFileAsync(
+          "ssh",
+          [...sshArgs, rc],
+          { maxBuffer: EXEC_BUFFER },
+        );
+        const partOut = [];
+        if (stdout) partOut.push(stdout);
+        if (stderr) partOut.push(`--- stderr ---\n${stderr}`);
+        outputs.push(partOut.join("\n") || "(no output)");
       }
       return { content: [{ type: "text", text: outputs.join("\n\n---\n\n") }] };
     } catch (e) {
@@ -459,8 +535,15 @@ server.tool(
         const lineWords = lines[i].split(/\s+/).filter(Boolean).length;
         currentChunk.push(lines[i]);
         currentWords += lineWords;
-
-        if (currentWords >= words_per_chunk && lines[i].trim() === "") {
+        // primary boundary: empty line after reaching target
+        // fallback: any line ending with sentence terminator after 1.5x target
+        // hard cap: 2x target on any line break
+        const onEmpty =
+          currentWords >= words_per_chunk && lines[i].trim() === "";
+        const onSentence =
+          currentWords >= words_per_chunk * 1.5 && /[.!?]\s*$/.test(lines[i]);
+        const onHardCap = currentWords >= words_per_chunk * 2;
+        if (onEmpty || onSentence || onHardCap) {
           chunks.push({
             start_line: startLine,
             end_line: i + 1,
@@ -602,9 +685,27 @@ server.tool(
 );
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 // Log wszystkich requestów do OAuth/MCP
+const SENSITIVE_KEYS = new Set([
+  "password",
+  "client_secret",
+  "code_verifier",
+  "refresh_token",
+  "code",
+  "access_token",
+]);
+
+function redact(obj) {
+  if (!obj || typeof obj !== "object") return obj;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    out[k] = SENSITIVE_KEYS.has(k) ? "[REDACTED]" : v;
+  }
+  return out;
+}
+
 app.use((req, res, next) => {
   if (
     req.path.startsWith("/oauth") ||
@@ -612,15 +713,21 @@ app.use((req, res, next) => {
     req.path.startsWith("/mcp")
   ) {
     console.log(`\n[${new Date().toISOString()}] ${req.method} ${req.path}`);
-    console.log("  query:", JSON.stringify(req.query));
-    console.log("  body:", JSON.stringify(req.body));
-    console.log("  headers.auth:", req.headers.authorization);
+    console.log("  query:", JSON.stringify(redact(req.query)));
+    console.log("  body:", JSON.stringify(redact(req.body)));
+    console.log(
+      "  headers.auth:",
+      req.headers.authorization ? "Bearer [REDACTED]" : "(none)",
+    );
     console.log("  headers.content-type:", req.headers["content-type"]);
   }
   next();
 });
 
-app.all("/mcp", async (req, res) => {
+app.use("/oauth/token", oauthLimiter);
+app.use("/oauth/authorize", oauthLimiter);
+
+const mcpHandler = async (req, res) => {
   const auth = req.headers.authorization || "";
   const bearer = auth.replace(/^Bearer\s+/, "");
   const tokenData = accessTokens.get(bearer);
@@ -637,7 +744,11 @@ app.all("/mcp", async (req, res) => {
   res.on("close", () => transport.close());
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
-});
+};
+
+app.post("/mcp", mcpHandler);
+app.get("/mcp", mcpHandler);
+app.delete("/mcp", mcpHandler);
 
 // === OAuth 2.1 endpoints dla MCP ===
 
@@ -650,7 +761,7 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
     registration_endpoint: `${BASE_URL}/oauth/register`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code"],
-    code_challenge_methods_supported: ["S256", "plain"],
+    code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
   });
 });
@@ -690,16 +801,36 @@ app.get("/oauth/authorize", (req, res) => {
     code_challenge,
     code_challenge_method,
   } = req.query;
-  if (!clients.has(client_id)) return res.status(400).send("Unknown client");
+  const client = clients.get(client_id);
+  if (!client) return res.status(400).send("Unknown client");
+  if (
+    !Array.isArray(client.redirect_uris) ||
+    !client.redirect_uris.includes(redirect_uri)
+  ) {
+    console.log(
+      "  -> FAIL: redirect_uri mismatch. got=",
+      redirect_uri,
+      "expected one of=",
+      client.redirect_uris,
+    );
+    return res.status(400).send("Invalid redirect_uri");
+  }
+  const esc = (s) =>
+    String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   res.send(`
     <html><body style="font-family:sans-serif;max-width:400px;margin:50px auto">
       <h2>Sign in to MCP</h2>
       <form method="POST" action="/oauth/authorize">
-        <input type="hidden" name="client_id" value="${client_id}">
-        <input type="hidden" name="redirect_uri" value="${redirect_uri}">
-        <input type="hidden" name="state" value="${state || ""}">
-        <input type="hidden" name="code_challenge" value="${code_challenge || ""}">
-        <input type="hidden" name="code_challenge_method" value="${code_challenge_method || ""}">
+        <input type="hidden" name="client_id" value="${esc(client_id)}">
+        <input type="hidden" name="redirect_uri" value="${esc(redirect_uri)}">
+        <input type="hidden" name="state" value="${esc(state)}">
+        <input type="hidden" name="code_challenge" value="${esc(code_challenge)}">
+        <input type="hidden" name="code_challenge_method" value="${esc(code_challenge_method)}">
         <p><input name="username" placeholder="username" style="width:100%;padding:8px"></p>
         <p><input name="password" type="password" placeholder="password" style="width:100%;padding:8px"></p>
         <button type="submit" style="padding:10px 20px">Sign in</button>
@@ -721,7 +852,18 @@ app.post(
       code_challenge,
       code_challenge_method,
     } = req.body;
-    if (username !== OAUTH_USER || password !== OAUTH_PASS) {
+    const client = clients.get(client_id);
+    if (!client) return res.status(400).send("Unknown client");
+    if (
+      !Array.isArray(client.redirect_uris) ||
+      !client.redirect_uris.includes(redirect_uri)
+    ) {
+      return res.status(400).send("Invalid redirect_uri");
+    }
+    if (
+      !safeCompare(username, OAUTH_USER) ||
+      !safeCompare(password, OAUTH_PASS)
+    ) {
       return res
         .status(401)
         .send(
@@ -748,9 +890,9 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
   const { grant_type, code, client_id, code_verifier } = req.body;
   console.log("  TOKEN req:", {
     grant_type,
-    code: code?.slice(0, 8),
+    code: code ? `${code.slice(0, 8)}...` : undefined,
     client_id,
-    code_verifier: code_verifier?.slice(0, 8),
+    code_verifier: code_verifier ? "[REDACTED]" : undefined,
   });
 
   // Obsługa refresh_token grant
@@ -790,28 +932,34 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
     return res.status(400).json({ error: "invalid_grant" });
   }
 
-  // PKCE verify
+  // PKCE verify - S256 only
   if (codeData.code_challenge) {
-    let challenge = code_verifier;
-    if (codeData.code_challenge_method === "S256") {
-      challenge = crypto
-        .createHash("sha256")
-        .update(code_verifier)
-        .digest("base64url");
+    if (codeData.code_challenge_method !== "S256") {
+      console.log(
+        "  -> FAIL: PKCE method not S256:",
+        codeData.code_challenge_method,
+      );
+      return res.status(400).json({ error: "invalid_grant" });
     }
-    console.log("  PKCE method=", codeData.code_challenge_method);
-    console.log(
-      "  PKCE expected=[",
-      codeData.code_challenge,
-      "] len=",
-      codeData.code_challenge?.length,
-    );
-    console.log("  PKCE got=     [", challenge, "] len=", challenge?.length);
-    console.log("  PKCE match=", challenge === codeData.code_challenge);
-    if (challenge !== codeData.code_challenge) {
+    if (!code_verifier) {
+      console.log("  -> FAIL: missing code_verifier");
+      return res.status(400).json({ error: "invalid_grant" });
+    }
+    const challenge = crypto
+      .createHash("sha256")
+      .update(code_verifier)
+      .digest("base64url");
+    if (
+      challenge.length !== codeData.code_challenge.length ||
+      !crypto.timingSafeEqual(
+        Buffer.from(challenge),
+        Buffer.from(codeData.code_challenge),
+      )
+    ) {
       console.log("  -> FAIL: PKCE mismatch");
       return res.status(400).json({ error: "invalid_grant" });
     }
+    console.log("  PKCE OK");
   }
 
   authCodes.delete(code);
