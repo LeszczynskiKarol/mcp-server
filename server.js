@@ -13,7 +13,7 @@ import path from "path";
 import { config } from "dotenv";
 config();
 
-// === Wczytaj hosts.json ===
+// === Load hosts.json ===
 const HOSTS_CONFIG_PATH =
   process.env.HOSTS_CONFIG || path.join(process.cwd(), "hosts.json");
 let HOSTS_CONFIG = { hosts: {}, keys: {} };
@@ -29,7 +29,7 @@ try {
   );
 }
 
-// === KONFIGURACJA z env ===
+// === Configuration from env ===
 const OAUTH_USER = process.env.MCP_USER || "admin";
 const OAUTH_PASS = process.env.MCP_PASS;
 const BASE_URL = process.env.MCP_BASE_URL;
@@ -44,19 +44,19 @@ const EXEC_BUFFER =
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_OWNER = process.env.GITHUB_OWNER || "";
 
-// Walidacja wymaganych
+// Validate required env
 const errors = [];
-if (!OAUTH_PASS) errors.push("MCP_PASS - hasło do logowania OAuth");
-if (!BASE_URL) errors.push("MCP_BASE_URL - np. https://your-domain.com");
+if (!OAUTH_PASS) errors.push("MCP_PASS - OAuth login password");
+if (!BASE_URL) errors.push("MCP_BASE_URL - e.g. https://your-domain.com");
 if (errors.length) {
-  console.error("Brak wymaganych zmiennych w .env:");
+  console.error("Missing required environment variables in .env:");
   errors.forEach((e) => console.error("  - " + e));
-  console.error("Skopiuj .env.example do .env i wypełnij.");
+  console.error("Copy .env.example to .env and fill it in.");
   process.exit(1);
 }
 
 if (!GITHUB_TOKEN)
-  console.warn("GITHUB_TOKEN nie ustawiony - tool github_api nie zadziała");
+  console.warn("GITHUB_TOKEN not set - github_api tool will not work");
 
 console.log(`MCP server: ${SERVER_NAME}`);
 console.log(`Base URL: ${BASE_URL}`);
@@ -73,11 +73,13 @@ const server = new McpServer({ name: SERVER_NAME, version: "1.0.0" });
 
 server.tool(
   "aws_cli",
-  "Wykonuje polecenie AWS CLI",
+  "Run an AWS CLI command using the locally configured AWS profile. Use for any AWS operation: describe-instances, s3 ls, logs filter-log-events, etc.",
   {
     command: z
       .string()
-      .describe("np. 'ec2 describe-instances --region eu-central-1'"),
+      .describe(
+        "AWS CLI command without the 'aws' prefix, e.g. 'ec2 describe-instances --region eu-central-1'",
+      ),
   },
   async ({ command }) => {
     const { stdout, stderr } = await execAsync(`aws ${command}`, {
@@ -89,16 +91,16 @@ server.tool(
 
 server.tool(
   "ssh_exec",
-  "SSH do dowolnego hosta używając klucza zdefiniowanego w hosts.json (sekcja 'keys'). Hostname jako string (IP lub DNS), user jako string (default ubuntu).",
+  "Run a shell command on a remote host over SSH using a key defined in hosts.json (the 'keys' section). Host is any IP or DNS, user defaults to 'ubuntu'.",
   {
     key: z
       .string()
-      .describe("nazwa klucza z hosts.json (np. 'main', 'maturapolski')"),
-    user: z.string().default("ubuntu"),
+      .describe("key name from hosts.json (e.g. 'main', 'production-key')"),
+    user: z.string().default("ubuntu").describe("SSH user (default: ubuntu)"),
     host: z
       .string()
-      .describe("IP albo DNS, np. '3.67.113.111' albo 'example.com'"),
-    command: z.string(),
+      .describe("IP or DNS, e.g. '1.2.3.4' or 'server.example.com'"),
+    command: z.string().describe("shell command to run on the remote host"),
   },
   async ({ key, user, host, command }) => {
     try {
@@ -121,17 +123,14 @@ server.tool(
 
 server.tool(
   "local_exec",
-  "Wykonuje dowolne polecenie shell na lokalnym komputerze (Windows). Użyj do edycji plików w D:\\mcp-server\\, restartowania pm2, git, npm itd. Komenda leci do cmd.exe.",
+  "Run a shell command on the local machine where this MCP server is running. On Windows the command goes to cmd.exe; on Linux/Mac to /bin/sh. Use for git, npm, file edits, pm2 control, etc.",
   {
     command: z
       .string()
       .describe(
-        "polecenie shell, np. 'type D:\\mcp-server\\server.js' albo 'pm2 list'",
+        "shell command, e.g. 'git status' or 'npm install' or 'pm2 list'",
       ),
-    cwd: z
-      .string()
-      .optional()
-      .describe("katalog roboczy, np. 'D:\\mcp-server' (opcjonalne)"),
+    cwd: z.string().optional().describe("working directory (optional)"),
   },
   async ({ command, cwd }) => {
     try {
@@ -156,14 +155,14 @@ server.tool(
 
 server.tool(
   "github_api",
-  "Wykonuje request do GitHub REST API. Używaj endpoint w formie '/repos/{owner}/{repo}/...' albo '/user/repos'. Domyślny owner: '" +
+  "Make a request to the GitHub REST API using the configured Personal Access Token. Use endpoint paths like '/repos/{owner}/{repo}/...' or '/user/repos'. Default owner: '" +
     GITHUB_OWNER +
-    "'. Skróty: jeśli endpoint zaczyna się od '/repos/NAZWA' (bez owner/), automatycznie wstawia domyślnego ownera. Method GET (default), POST, PATCH, PUT, DELETE.",
+    "'. Shortcut: if the endpoint starts with '/repos/NAME' (without owner/), the default owner is auto-prepended. Methods: GET (default), POST, PATCH, PUT, DELETE.",
   {
     endpoint: z
       .string()
       .describe(
-        "ścieżka API, np. '/repos/maturapolski/issues' albo '/user/repos'. Bez 'https://api.github.com'.",
+        "API path, e.g. '/repos/owner/repo/issues' or '/user/repos'. Do not include 'https://api.github.com'.",
       ),
     method: z
       .enum(["GET", "POST", "PATCH", "PUT", "DELETE"])
@@ -172,16 +171,18 @@ server.tool(
     body: z
       .record(z.any())
       .optional()
-      .describe("body jako JSON object (dla POST/PATCH/PUT)"),
+      .describe("body as JSON object (for POST/PATCH/PUT)"),
     query: z
       .record(z.string())
       .optional()
-      .describe("query params jako object, np. {state:'open', per_page:'30'}"),
+      .describe(
+        "query params as an object, e.g. {state:'open', per_page:'30'}",
+      ),
   },
   async ({ endpoint, method, body, query }) => {
     if (!GITHUB_TOKEN)
       return {
-        content: [{ type: "text", text: "❌ Brak GITHUB_TOKEN w .env" }],
+        content: [{ type: "text", text: "GITHUB_TOKEN not set in .env" }],
         isError: true,
       };
 
@@ -241,7 +242,7 @@ function resolveKeyPath(keyName) {
   const p = (HOSTS_CONFIG.keys || {})[keyName];
   if (!p)
     throw new Error(
-      `Nieznany klucz '${keyName}'. Dostępne: ${Object.keys(HOSTS_CONFIG.keys || {}).join(", ") || "(hosts.json nie wczytany)"}`,
+      `Unknown key '${keyName}'. Available: ${Object.keys(HOSTS_CONFIG.keys || {}).join(", ") || "(hosts.json not loaded)"}`,
     );
   // Cross-platform path normalization: tilde, forward slashes
   let resolved = p;
@@ -258,7 +259,7 @@ function buildSsh(hostKey) {
   const h = (HOSTS_CONFIG.hosts || {})[hostKey];
   if (!h)
     throw new Error(
-      `Nieznany host '${hostKey}'. Dostępne: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(hosts.json nie wczytany)"}`,
+      `Unknown host '${hostKey}'. Available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(hosts.json not loaded)"}`,
     );
   const user = h.user || "ubuntu";
   return `ssh -i "${resolveKeyPath(h.key)}" -o StrictHostKeyChecking=no ${user}@${h.ip}`;
@@ -266,25 +267,25 @@ function buildSsh(hostKey) {
 
 server.tool(
   "postgres_query",
-  "Wykonuje zapytanie SQL na bazie PostgreSQL przez SSH na konkretnym serwerze. Host: 'panel' (panel.torweb.pl, 3.67.113.111). Używa psql przez sudo -u postgres, więc bez hasła. SELECT zwraca dane, inne komendy DML/DDL też działają (UWAGA: produkcja, nie testuj).",
+  "Run a SQL query on a PostgreSQL database over SSH on a remote host from hosts.json. Uses psql via 'sudo -u postgres', so no password is needed (passwordless sudo required on the remote). SELECT returns data; DML/DDL also work - be careful on production databases.",
   {
     host: z
       .string()
       .describe(
-        `który serwer - dostępne z hosts.json: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(brak)"}`,
+        `host from hosts.json - available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none - hosts.json not loaded)"}`,
       ),
     database: z
       .string()
-      .describe("nazwa bazy, np. 'maturapolski' albo 'panel_torweb'"),
+      .describe("database name, e.g. 'mydb' or 'app_production'"),
     query: z
       .string()
       .describe(
-        "zapytanie SQL, np. \"SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '1 day'\"",
+        "SQL query, e.g. \"SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '1 day'\"",
       ),
     format: z
       .enum(["table", "csv", "json"])
       .default("table")
-      .describe("format outputu psql"),
+      .describe("psql output format"),
   },
   async ({ host, database, query, format }) => {
     try {
@@ -314,18 +315,18 @@ server.tool(
 
 server.tool(
   "pm2_status",
-  "Pokazuje status pm2 (lista procesów + opcjonalnie ostatnie logi) na wybranym serwerze EC2. Użyj do szybkiej diagnozy: 'pm2_status host=panel' albo z logami 'pm2_status host=matury app=mojaapka lines=100'.",
+  "Show PM2 status (process list and optionally recent logs) on a remote host. Quick diagnostics: 'pm2_status host=production' or with logs 'pm2_status host=production app=myapp lines=100'. Requires PM2 installed on the remote (under NVM is fine - nvm.sh is auto-sourced).",
   {
     host: z
       .string()
       .describe(
-        `który serwer - dostępne z hosts.json: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(brak)"}`,
+        `host from hosts.json - available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none - hosts.json not loaded)"}`,
       ),
     app: z
       .string()
       .optional()
       .describe(
-        "nazwa konkretnej aplikacji pm2 (jeśli chcesz logi tylko jej). Bez tego = tylko lista procesów.",
+        "specific PM2 app name (if you want logs for one app only). Omit for process list only.",
       ),
     lines: z
       .number()
@@ -333,12 +334,12 @@ server.tool(
       .min(0)
       .max(500)
       .default(0)
-      .describe("ile linii logów. 0 = bez logów (tylko lista)"),
+      .describe("how many log lines to show. 0 = no logs (list only)"),
   },
   async ({ host, app, lines }) => {
     try {
       const ssh = buildSsh(host);
-      // Explicite ładujemy nvm.sh, bo .bashrc ma early return dla non-interactive shelli
+      // Explicitly source nvm.sh because .bashrc has an early return for non-interactive shells
       const wrap = (cmd) => {
         const script = [
           'export NVM_DIR="$HOME/.nvm"',
@@ -376,12 +377,16 @@ server.tool(
 
 server.tool(
   "book_chunk",
-  "Czyta fragment dużego pliku tekstowego (np. książki) podzielony na 'chunks' (~3000 słów każdy). Użyj iteracyjnie żeby przeczytać całość. Tool zwraca chunk + metadane: chunk_index, total_chunks, line_range. Plik musi być wstępnie podzielony przez book_split.",
+  "Read one chunk of a large text file (e.g. a book) that was pre-split into ~3000-word chunks by book_split. Use iteratively to read through a whole document that does not fit in the context window. Returns the chunk text plus metadata (chunk_index, total_chunks, line_range).",
   {
     book_dir: z
       .string()
-      .describe("katalog z chunks, np. 'D:\\ksiazka\\chunks'"),
-    chunk_index: z.number().int().min(0).describe("który chunk (0-indexed)"),
+      .describe("directory containing chunks, e.g. '/path/to/book/chunks'"),
+    chunk_index: z
+      .number()
+      .int()
+      .min(0)
+      .describe("which chunk to read (0-indexed)"),
   },
   async ({ book_dir, chunk_index }) => {
     try {
@@ -393,7 +398,7 @@ server.tool(
           content: [
             {
               type: "text",
-              text: `Koniec książki. Total chunks: ${meta.total_chunks}`,
+              text: `End of document. Total chunks: ${meta.total_chunks}`,
             },
           ],
         };
@@ -422,13 +427,23 @@ server.tool(
 
 server.tool(
   "book_split",
-  "Dzieli duży plik tekstowy na chunks po ~3000 słów każdy. Zapisuje chunks + metadane do katalogu. Po tym używaj book_chunk żeby je czytać.",
+  "Split a large text file into chunks of ~N words each (default 3000). Saves chunks and a _meta.json index to the output directory. After splitting, use book_chunk to iterate through them.",
   {
-    input_file: z.string().describe("ścieżka do pliku, np. 'D:\\ksiazka.txt'"),
+    input_file: z
+      .string()
+      .describe("path to the source text file, e.g. '/path/to/book.txt'"),
     output_dir: z
       .string()
-      .describe("katalog na chunks, np. 'D:\\ksiazka\\chunks'"),
-    words_per_chunk: z.number().int().min(500).max(10000).default(3000),
+      .describe(
+        "directory where chunks will be written, e.g. '/path/to/book/chunks'",
+      ),
+    words_per_chunk: z
+      .number()
+      .int()
+      .min(500)
+      .max(10000)
+      .default(3000)
+      .describe("target words per chunk (default 3000)"),
   },
   async ({ input_file, output_dir, words_per_chunk }) => {
     try {
@@ -496,7 +511,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `OK - podzielono na ${chunks.length} chunks po ~${words_per_chunk} słów. Meta: ${path.join(output_dir, "_meta.json")}`,
+            text: `OK - split into ${chunks.length} chunks of ~${words_per_chunk} words. Meta: ${path.join(output_dir, "_meta.json")}`,
           },
         ],
       };
@@ -511,18 +526,26 @@ server.tool(
 
 server.tool(
   "book_note",
-  "Zarządza notatkami/mapą książki w pliku JSON. Claude może tu zapisywać i czytać: glosariusz postaci, streszczenia rozdziałów, listę poprawek do zrobienia, znalezione niespójności itd. Operacje: get (czyta cały JSON), set (nadpisuje klucz), append (dodaje do listy pod kluczem).",
+  "Read/write structured notes for a long document in a JSON file (_notes.json in book_dir). Useful for tracking glossaries, chapter summaries, TODO lists, inconsistencies found while iterating through a long text. Operations: get (read the whole JSON or one key), set (overwrite a key), append (push to a list under a key). Keys support dot-notation for nesting (e.g. 'summaries.chapter_1').",
   {
-    book_dir: z.string().describe("katalog książki, np. 'D:\\ksiazka'"),
-    operation: z.enum(["get", "set", "append"]),
+    book_dir: z
+      .string()
+      .describe(
+        "book directory (where _notes.json lives), e.g. '/path/to/book'",
+      ),
+    operation: z.enum(["get", "set", "append"]).describe("get | set | append"),
     key: z
       .string()
       .optional()
-      .describe("klucz w JSON (np. 'postacie', 'streszczenia.rozdzial_1')"),
+      .describe(
+        "JSON key with optional dot-notation, e.g. 'characters' or 'summaries.chapter_1'",
+      ),
     value: z
       .any()
       .optional()
-      .describe("wartość do zapisu (string, obiekt, array)"),
+      .describe(
+        "value to write (string, object, array) - required for set/append",
+      ),
   },
   async ({ book_dir, operation, key, value }) => {
     try {
@@ -670,16 +693,16 @@ app.get("/oauth/authorize", (req, res) => {
   if (!clients.has(client_id)) return res.status(400).send("Unknown client");
   res.send(`
     <html><body style="font-family:sans-serif;max-width:400px;margin:50px auto">
-      <h2>Login do MCP</h2>
+      <h2>Sign in to MCP</h2>
       <form method="POST" action="/oauth/authorize">
         <input type="hidden" name="client_id" value="${client_id}">
         <input type="hidden" name="redirect_uri" value="${redirect_uri}">
         <input type="hidden" name="state" value="${state || ""}">
         <input type="hidden" name="code_challenge" value="${code_challenge || ""}">
         <input type="hidden" name="code_challenge_method" value="${code_challenge_method || ""}">
-        <p><input name="username" placeholder="user" style="width:100%;padding:8px"></p>
-        <p><input name="password" type="password" placeholder="hasło" style="width:100%;padding:8px"></p>
-        <button type="submit" style="padding:10px 20px">Zaloguj</button>
+        <p><input name="username" placeholder="username" style="width:100%;padding:8px"></p>
+        <p><input name="password" type="password" placeholder="password" style="width:100%;padding:8px"></p>
+        <button type="submit" style="padding:10px 20px">Sign in</button>
       </form>
     </body></html>
   `);
@@ -702,7 +725,7 @@ app.post(
       return res
         .status(401)
         .send(
-          "Nieprawidłowe dane. <a href='javascript:history.back()'>Wróć</a>",
+          "Invalid credentials. <a href='javascript:history.back()'>Back</a>",
         );
     }
     const code = crypto.randomBytes(24).toString("hex");
@@ -796,7 +819,7 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
   const refresh_token = crypto.randomBytes(32).toString("hex");
   accessTokens.set(access_token, {
     client_id,
-    expires: Date.now() + TOKEN_TTL_MS, // 30 dni
+    expires: Date.now() + TOKEN_TTL_MS, // 30 days by default
   });
   const response = {
     access_token,

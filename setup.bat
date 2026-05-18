@@ -2,17 +2,17 @@
 echo === MCP Server setup ===
 if not exist .env (
     copy .env.example .env
-    echo Utworzono .env z .env.example - edytuj i wypelnij MCP_PASS, MCP_BASE_URL
+    echo Created .env from .env.example - edit it and fill in MCP_PASS, MCP_BASE_URL
 ) else (
-    echo .env juz istnieje, pomijam
+    echo .env already exists, skipping
 )
 if not exist hosts.json (
     copy hosts.example.json hosts.json
-    echo Utworzono hosts.json z hosts.example.json - edytuj i dodaj swoje serwery
+    echo Created hosts.json from hosts.example.json - edit it and add your servers
 ) else (
-    echo hosts.json juz istnieje, pomijam
+    echo hosts.json already exists, skipping
 )
-echo === Instaluje zaleznosci ===
+echo === Installing dependencies ===
 call npm install
-echo === Gotowe ===
-echo Edytuj .env i hosts.json, potem uruchom: node server.js
+echo === Done ===
+echo Edit .env and hosts.json, then run: node server.js
