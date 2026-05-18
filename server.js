@@ -7,6 +7,8 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { z } from "zod";
 import crypto from "crypto";
+import fs from "fs/promises";
+import path from "path";
 import { config } from "dotenv";
 config();
 
@@ -276,8 +278,17 @@ server.tool(
     try {
       const ssh = buildSsh(host);
       // Explicite ładujemy nvm.sh, bo .bashrc ma early return dla non-interactive shelli
-      const nvmInit = `export NVM_DIR=\\"\\$HOME/.nvm\\"; [ -s \\"\\$NVM_DIR/nvm.sh\\" ] && . \\"\\$NVM_DIR/nvm.sh\\";`;
-      const wrap = (cmd) => `${ssh} "bash -c '${nvmInit} ${cmd}'"`;
+      const wrap = (cmd) => {
+        const script = [
+          'export NVM_DIR="$HOME/.nvm"',
+          '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"',
+          'export PATH="$PATH:/usr/local/bin:/usr/bin"',
+          cmd,
+        ].join("\n");
+        const b64 = Buffer.from(script).toString("base64");
+        return `${ssh} "echo ${b64} | base64 -d | bash"`;
+      };
+
       const parts = [wrap("pm2 list")];
       if (lines > 0) {
         const target = app ? app : "all";
@@ -296,6 +307,210 @@ server.tool(
         content: [
           { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
         ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "book_chunk",
+  "Czyta fragment dużego pliku tekstowego (np. książki) podzielony na 'chunks' (~3000 słów każdy). Użyj iteracyjnie żeby przeczytać całość. Tool zwraca chunk + metadane: chunk_index, total_chunks, line_range. Plik musi być wstępnie podzielony przez book_split.",
+  {
+    book_dir: z
+      .string()
+      .describe("katalog z chunks, np. 'D:\\ksiazka\\chunks'"),
+    chunk_index: z.number().int().min(0).describe("który chunk (0-indexed)"),
+  },
+  async ({ book_dir, chunk_index }) => {
+    try {
+      const meta = JSON.parse(
+        await fs.readFile(path.join(book_dir, "_meta.json"), "utf8"),
+      );
+      if (chunk_index >= meta.total_chunks) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Koniec książki. Total chunks: ${meta.total_chunks}`,
+            },
+          ],
+        };
+      }
+      const chunkPath = path.join(
+        book_dir,
+        `chunk_${String(chunk_index).padStart(4, "0")}.txt`,
+      );
+      const text = await fs.readFile(chunkPath, "utf8");
+      return {
+        content: [
+          {
+            type: "text",
+            text: `[CHUNK ${chunk_index + 1}/${meta.total_chunks}, lines ${meta.chunks[chunk_index].start_line}-${meta.chunks[chunk_index].end_line}]\n\n${text}`,
+          },
+        ],
+      };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `ERROR: ${e.message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "book_split",
+  "Dzieli duży plik tekstowy na chunks po ~3000 słów każdy. Zapisuje chunks + metadane do katalogu. Po tym używaj book_chunk żeby je czytać.",
+  {
+    input_file: z.string().describe("ścieżka do pliku, np. 'D:\\ksiazka.txt'"),
+    output_dir: z
+      .string()
+      .describe("katalog na chunks, np. 'D:\\ksiazka\\chunks'"),
+    words_per_chunk: z.number().int().min(500).max(10000).default(3000),
+  },
+  async ({ input_file, output_dir, words_per_chunk }) => {
+    try {
+      await fs.mkdir(output_dir, { recursive: true });
+      const text = await fs.readFile(input_file, "utf8");
+      const lines = text.split("\n");
+      const chunks = [];
+      let currentChunk = [];
+      let currentWords = 0;
+      let startLine = 1;
+
+      for (let i = 0; i < lines.length; i++) {
+        const lineWords = lines[i].split(/\s+/).filter(Boolean).length;
+        currentChunk.push(lines[i]);
+        currentWords += lineWords;
+
+        if (currentWords >= words_per_chunk && lines[i].trim() === "") {
+          chunks.push({
+            start_line: startLine,
+            end_line: i + 1,
+            words: currentWords,
+            lines: currentChunk,
+          });
+          currentChunk = [];
+          currentWords = 0;
+          startLine = i + 2;
+        }
+      }
+      if (currentChunk.length > 0) {
+        chunks.push({
+          start_line: startLine,
+          end_line: lines.length,
+          words: currentWords,
+          lines: currentChunk,
+        });
+      }
+
+      for (let i = 0; i < chunks.length; i++) {
+        const filename = path.join(
+          output_dir,
+          `chunk_${String(i).padStart(4, "0")}.txt`,
+        );
+        await fs.writeFile(filename, chunks[i].lines.join("\n"), "utf8");
+      }
+
+      const meta = {
+        input_file,
+        total_chunks: chunks.length,
+        total_lines: lines.length,
+        words_per_chunk,
+        chunks: chunks.map((c) => ({
+          start_line: c.start_line,
+          end_line: c.end_line,
+          words: c.words,
+        })),
+        created_at: new Date().toISOString(),
+      };
+      await fs.writeFile(
+        path.join(output_dir, "_meta.json"),
+        JSON.stringify(meta, null, 2),
+        "utf8",
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `OK - podzielono na ${chunks.length} chunks po ~${words_per_chunk} słów. Meta: ${path.join(output_dir, "_meta.json")}`,
+          },
+        ],
+      };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `ERROR: ${e.message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "book_note",
+  "Zarządza notatkami/mapą książki w pliku JSON. Claude może tu zapisywać i czytać: glosariusz postaci, streszczenia rozdziałów, listę poprawek do zrobienia, znalezione niespójności itd. Operacje: get (czyta cały JSON), set (nadpisuje klucz), append (dodaje do listy pod kluczem).",
+  {
+    book_dir: z.string().describe("katalog książki, np. 'D:\\ksiazka'"),
+    operation: z.enum(["get", "set", "append"]),
+    key: z
+      .string()
+      .optional()
+      .describe("klucz w JSON (np. 'postacie', 'streszczenia.rozdzial_1')"),
+    value: z
+      .any()
+      .optional()
+      .describe("wartość do zapisu (string, obiekt, array)"),
+  },
+  async ({ book_dir, operation, key, value }) => {
+    try {
+      const notesFile = path.join(book_dir, "_notes.json");
+      let notes = {};
+      try {
+        notes = JSON.parse(await fs.readFile(notesFile, "utf8"));
+      } catch {}
+
+      if (operation === "get") {
+        if (!key)
+          return {
+            content: [{ type: "text", text: JSON.stringify(notes, null, 2) }],
+          };
+        const val = key.split(".").reduce((o, k) => o?.[k], notes);
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(val, null, 2) ?? "null" },
+          ],
+        };
+      }
+
+      if (operation === "set") {
+        const keys = key.split(".");
+        let obj = notes;
+        for (let i = 0; i < keys.length - 1; i++) {
+          if (!obj[keys[i]]) obj[keys[i]] = {};
+          obj = obj[keys[i]];
+        }
+        obj[keys[keys.length - 1]] = value;
+      }
+
+      if (operation === "append") {
+        const keys = key.split(".");
+        let obj = notes;
+        for (let i = 0; i < keys.length - 1; i++) {
+          if (!obj[keys[i]]) obj[keys[i]] = {};
+          obj = obj[keys[i]];
+        }
+        const k = keys[keys.length - 1];
+        if (!Array.isArray(obj[k])) obj[k] = [];
+        obj[k].push(value);
+      }
+
+      await fs.writeFile(notesFile, JSON.stringify(notes, null, 2), "utf8");
+      return { content: [{ type: "text", text: `OK ${operation} ${key}` }] };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `ERROR: ${e.message}` }],
         isError: true,
       };
     }

@@ -352,3 +352,7 @@ C:\Users\Admin\frp\frp_0.61.1_windows_amd64
 └── frpc-mcp.toml          # osobny config tunela mcp (port 4500 → mcp.torweb.pl)
 
 ```
+
+restart lokalnie:
+
+Get-WmiObject Win32*Process -Filter "Name='node.exe'" | Where-Object { $*.CommandLine -like "_mcp-server\server.js_" } | ForEach-Object { Stop-Process -Id $\_.ProcessId -Force }; Start-Sleep 2; Start-Process -FilePath "D:\mcp-server\start-mcp.bat" -WindowStyle Minimized
