@@ -275,10 +275,13 @@ server.tool(
   async ({ host, app, lines }) => {
     try {
       const ssh = buildSsh(host);
-      const parts = [`${ssh} "pm2 list"`];
+      // Explicite ładujemy nvm.sh, bo .bashrc ma early return dla non-interactive shelli
+      const nvmInit = `export NVM_DIR=\\"\\$HOME/.nvm\\"; [ -s \\"\\$NVM_DIR/nvm.sh\\" ] && . \\"\\$NVM_DIR/nvm.sh\\";`;
+      const wrap = (cmd) => `${ssh} "bash -c '${nvmInit} ${cmd}'"`;
+      const parts = [wrap("pm2 list")];
       if (lines > 0) {
         const target = app ? app : "all";
-        parts.push(`${ssh} "pm2 logs ${target} --lines ${lines} --nostream"`);
+        parts.push(wrap(`pm2 logs ${target} --lines ${lines} --nostream`));
       }
       const outputs = [];
       for (const cmd of parts) {
