@@ -9,7 +9,7 @@ import { z } from "zod";
 import crypto from "crypto";
 
 const OAUTH_USER = "admin";
-const OAUTH_PASS = "Basketball321**"; // tylko Ty będziesz to znać
+const OAUTH_PASS = "*****"; // tylko Ty będziesz to znać
 const BASE_URL = "https://mcp.torweb.pl";
 
 const clients = new Map(); // client_id -> { client_secret, redirect_uris }
@@ -90,7 +90,7 @@ app.all("/mcp", async (req, res) => {
     return res.status(401).end();
   }
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => crypto.randomUUID(),
+    sessionIdGenerator: undefined,
   });
   res.on("close", () => transport.close());
   await server.connect(transport);
