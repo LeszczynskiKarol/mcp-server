@@ -19,6 +19,11 @@ if (!OAUTH_PASS) {
   process.exit(1);
 }
 
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_OWNER = process.env.GITHUB_OWNER || "";
+if (!GITHUB_TOKEN)
+  console.warn("⚠️ Brak GITHUB_TOKEN - tool github_api nie zadziała");
+
 const clients = new Map(); // client_id -> { client_secret, redirect_uris }
 const authCodes = new Map(); // code -> { client_id, redirect_uri, expires }
 const accessTokens = new Map(); // access_token -> { client_id, expires }
@@ -62,6 +67,124 @@ server.tool(
       { maxBuffer: 10 * 1024 * 1024 },
     );
     return { content: [{ type: "text", text: stdout || stderr }] };
+  },
+);
+
+server.tool(
+  "local_exec",
+  "Wykonuje dowolne polecenie shell na lokalnym komputerze (Windows). Użyj do edycji plików w D:\\mcp-server\\, restartowania pm2, git, npm itd. Komenda leci do cmd.exe.",
+  {
+    command: z
+      .string()
+      .describe(
+        "polecenie shell, np. 'type D:\\mcp-server\\server.js' albo 'pm2 list'",
+      ),
+    cwd: z
+      .string()
+      .optional()
+      .describe("katalog roboczy, np. 'D:\\mcp-server' (opcjonalne)"),
+  },
+  async ({ command, cwd }) => {
+    try {
+      const { stdout, stderr } = await execAsync(command, {
+        maxBuffer: 10 * 1024 * 1024,
+        cwd: cwd || undefined,
+        shell: "cmd.exe",
+      });
+      return {
+        content: [{ type: "text", text: stdout || stderr || "(no output)" }],
+      };
+    } catch (e) {
+      return {
+        content: [
+          { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  "github_api",
+  "Wykonuje request do GitHub REST API. Używaj endpoint w formie '/repos/{owner}/{repo}/...' albo '/user/repos'. Domyślny owner: '" +
+    GITHUB_OWNER +
+    "'. Skróty: jeśli endpoint zaczyna się od '/repos/NAZWA' (bez owner/), automatycznie wstawia domyślnego ownera. Method GET (default), POST, PATCH, PUT, DELETE.",
+  {
+    endpoint: z
+      .string()
+      .describe(
+        "ścieżka API, np. '/repos/maturapolski/issues' albo '/user/repos'. Bez 'https://api.github.com'.",
+      ),
+    method: z
+      .enum(["GET", "POST", "PATCH", "PUT", "DELETE"])
+      .default("GET")
+      .describe("HTTP method"),
+    body: z
+      .record(z.any())
+      .optional()
+      .describe("body jako JSON object (dla POST/PATCH/PUT)"),
+    query: z
+      .record(z.string())
+      .optional()
+      .describe("query params jako object, np. {state:'open', per_page:'30'}"),
+  },
+  async ({ endpoint, method, body, query }) => {
+    if (!GITHUB_TOKEN)
+      return {
+        content: [{ type: "text", text: "❌ Brak GITHUB_TOKEN w .env" }],
+        isError: true,
+      };
+
+    // auto-prefix ownera jeśli krótki shortcut "/repos/nazwa-repo/..."
+    let ep = endpoint.startsWith("/") ? endpoint : "/" + endpoint;
+    const shortMatch = ep.match(/^\/repos\/([^\/]+)(\/.*)?$/);
+    if (shortMatch && !shortMatch[1].includes("/") && GITHUB_OWNER) {
+      // sprawdź czy to nie jest już owner/repo (czyli jest druga ukośnik wewnątrz pierwszego segmentu)
+      const parts = ep.split("/");
+      // /repos/X/Y/... -> parts = ["", "repos", "X", "Y", ...]
+      // jeśli parts[3] istnieje i nie ma kropki (nazwa repo), to znaczy że X jest ownerem i Y jest repo
+      // jeśli parts[3] nie istnieje albo wygląda na sub-resource, X jest skrótem nazwy repo
+      if (parts.length < 4) {
+        ep = `/repos/${GITHUB_OWNER}/${parts[2]}`;
+      }
+    }
+
+    const url = new URL("https://api.github.com" + ep);
+    if (query)
+      for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
+
+    try {
+      const resp = await fetch(url.toString(), {
+        method,
+        headers: {
+          Authorization: `Bearer ${GITHUB_TOKEN}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "mcp-aws-ssh",
+          ...(body ? { "Content-Type": "application/json" } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      const text = await resp.text();
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = text;
+      }
+      const out =
+        typeof parsed === "string" ? parsed : JSON.stringify(parsed, null, 2);
+      return {
+        content: [{ type: "text", text: `HTTP ${resp.status}\n\n${out}` }],
+        isError: !resp.ok,
+      };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `ERROR: ${e.message}` }],
+        isError: true,
+      };
+    }
   },
 );
 
