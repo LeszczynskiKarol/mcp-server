@@ -1,0 +1,21 @@
+{
+  "_comment": "Lista serwerów dla ssh_exec, postgres_query, pm2_status. 'key' to nazwa z sekcji 'keys' poniżej.",
+  "hosts": {
+    "production": {
+      "ip": "1.2.3.4",
+      "user": "ubuntu",
+      "key": "main",
+      "description": "Główny serwer produkcyjny"
+    },
+    "staging": {
+      "ip": "5.6.7.8",
+      "user": "ubuntu",
+      "key": "main",
+      "description": "Środowisko staging"
+    }
+  },
+  "_comment_keys": "Mapowanie nazw kluczy na ścieżki do plików .pem. Forward slashes działają cross-platform.",
+  "keys": {
+    "main": "/path/to/your-key.pem"
+  }
+}

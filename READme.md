@@ -1,149 +1,128 @@
-# MCP Server — AWS CLI + SSH + Local + GitHub + Postgres + PM2
+# MCP Server
 
-Lokalny MCP server, który daje Claude.ai (lub innemu klientowi MCP) bezpośredni dostęp do **AWS CLI**, **SSH na instancje EC2 przez klucze .pem**, **lokalnego shella Windows** oraz **GitHub REST API** — bez kopiowania promptów i bez Claude Code.
-
-Server chodzi lokalnie na Windowsie. Wystawia się go publicznie przez tunel HTTPS (frp + nginx + Let's Encrypt na osobnym VPS). Claude.ai łączy się z nim jako Custom Connector i może wywoływać polecenia jakby siedział na Twoim kompie.
-
----
+Lokalny MCP server dający klientom MCP (Claude.ai, Claude Desktop, custom) bezpośredni dostęp do **AWS CLI**, **SSH na zdalne serwery**, **lokalnego shella**, **GitHub REST API**, **PostgreSQL** i **PM2** na zdalnych serwerach. Wystawiany przez tunel HTTPS z OAuth 2.1.
 
 ## Architektura
 
 ```
-┌─────────────┐    HTTPS     ┌──────────────────┐    HTTP    ┌──────────┐    tunel    ┌─────────────┐
-│  Claude.ai  │ ───────────► │  nginx + cert    │ ─────────► │   frps   │ ──────────► │ frpc + node │
-│  (cloud)    │              │  na VPS AWS      │  :8080     │ (vhost)  │             │  (Twój PC)  │
-└─────────────┘              └──────────────────┘            └──────────┘             └─────────────┘
-                                                                                            │
-                                                                              ┌─────────────┴─────────────┐
-                                                                              ▼                           ▼
-                                                                       ┌──────────┐              ┌────────────────┐
-                                                                       │ AWS CLI  │              │ ssh -i *.pem   │
-                                                                       │ (lokal)  │              │ ec2-user@host  │
-                                                                       └──────────┘              └────────────────┘
+┌─────────────┐   HTTPS    ┌──────────────────┐   HTTP    ┌──────────┐   tunel   ┌─────────────┐
+│  Claude.ai  │ ─────────► │  nginx + cert    │ ────────► │   frps   │ ────────► │ frpc + node │
+│   (cloud)   │            │   na VPS         │  :8080    │ (vhost)  │           │ (lokalny PC)│
+└─────────────┘            └──────────────────┘           └──────────┘           └─────────────┘
+                                                                                       │
+                                                       ┌───────────────────────────────┼───────────────────────────────┐
+                                                       ▼                               ▼                               ▼
+                                                 ┌──────────┐                  ┌────────────────┐              ┌──────────────┐
+                                                 │ AWS CLI  │                  │ ssh -i *.pem   │              │ cmd.exe      │
+                                                 │ (lokal)  │                  │ user@host      │              │ git/npm/...  │
+                                                 └──────────┘                  └────────────────┘              └──────────────┘
 ```
 
----
+Klucze SSH, GitHub PAT i AWS credentials **nigdy nie opuszczają lokalnej maszyny**. Tunel przenosi tylko żądania MCP i ich wyniki.
 
-## Co to robi
+## Tools
 
-Wystawia cztery narzędzia MCP, których Claude może użyć w czacie:
-
-- **`aws_cli`** — wykonuje dowolne polecenie AWS CLI używając lokalnego profilu (`aws ec2 describe-instances ...`)
-- **`ssh_exec`** — wykonuje polecenie po SSH na wskazanym hoście, używając jednego z dwóch kluczy `.pem` (`maturapolski` lub `moja-aplikacja`)
-- **`local_exec`** — wykonuje dowolne polecenie shell (`cmd.exe`) na lokalnym Windowsie. Edycja plików, git, npm, pm2 lokalny, dowolny soft.
-- **`github_api`** — wykonuje request do GitHub REST API używając Personal Access Token. Issues, PRs, commits, contents, workflows.
-- **`postgres_query`** — wykonuje zapytanie SQL na bazie PostgreSQL przez SSH (`sudo -u postgres psql`). Działa na zdefiniowanych hostach (`panel`, `matury`), bez hasła do bazy.
-- **`pm2_status`** — pokazuje `pm2 list` i opcjonalnie ostatnie logi (`pm2 logs --nostream`) na wskazanym serwerze. Szybka diagnoza bez wchodzenia ręcznie po SSH.
-
-Klucze `.pem` i GitHub PAT **nigdy nie opuszczają Twojej maszyny**. Tunel przenosi tylko żądania MCP (komendy do wykonania) i ich wyniki.
-
----
+| Tool             | Co robi                                                      |
+| ---------------- | ------------------------------------------------------------ |
+| `aws_cli`        | Wykonuje `aws <command>` używając lokalnego profilu AWS CLI  |
+| `ssh_exec`       | SSH na dowolny host przez klucz z `hosts.json`               |
+| `local_exec`     | Dowolne polecenie shell na lokalnym Windows (cmd.exe)        |
+| `github_api`     | Request do GitHub REST API używając Personal Access Token    |
+| `postgres_query` | `psql` przez SSH (sudo -u postgres) na hoście z `hosts.json` |
+| `pm2_status`     | `pm2 list` + opcjonalne logi na zdalnym hoście               |
+| `book_split`     | Dzieli duży plik tekstowy na chunki (~3000 słów)             |
+| `book_chunk`     | Czyta jeden chunk z katalogu z `_meta.json`                  |
+| `book_note`      | Zarządza notatkami JSON dla iteracyjnej pracy nad książką    |
 
 ## Wymagania
 
-- Node.js 18+
-- Lokalnie skonfigurowane AWS CLI (`aws configure`)
-- Klucze SSH `.pem` w stałej lokalizacji
-- Publiczny adres HTTPS dla MCP servera (tu: `https://mcp.torweb.pl/mcp` przez frp + nginx)
+- Node.js 18+ (sprawdzone na 22, 24, 25)
+- Klucze SSH `.pem` lokalnie (do hostów które chcesz kontrolować)
+- AWS CLI skonfigurowane lokalnie (`aws configure`) - tylko jeśli używasz `aws_cli`
+- Publiczna domena z HTTPS - jeśli wystawiasz dla Claude.ai
 
----
-
-## Instalacja
+## Quick start
 
 ```bash
-cd D:\mcp-server
+git clone https://github.com/LeszczynskiKarol/mcp-server.git
+cd mcp-server
 npm install
+cp .env.example .env          # wypełnij MCP_PASS i MCP_BASE_URL
+cp hosts.example.json hosts.json   # dodaj swoje serwery
+node server.js
 ```
 
-`package.json`:
+Powinieneś zobaczyć:
+
+```
+Loaded N hosts and M keys from ./hosts.json
+MCP server: ...
+Port: 4500
+MCP listening on :4500
+```
+
+## Konfiguracja
+
+### `.env` (sekrety, NIE commitować)
+
+```env
+# WYMAGANE
+MCP_USER=admin
+MCP_PASS=<długie hasło, min 20 znaków>
+MCP_BASE_URL=https://your-domain.com
+
+# OPCJONALNE - GitHub
+GITHUB_TOKEN=github_pat_xxxxxxxxxxxxxxxx
+GITHUB_OWNER=YourGitHubUsername
+
+# OPCJONALNE - tuning
+PORT=4500
+TOKEN_TTL_SECONDS=2592000      # 30 dni
+AUTH_CODE_TTL_SECONDS=600      # 10 min
+EXEC_BUFFER_MB=10
+MCP_SERVER_NAME=my-mcp-server
+HOSTS_CONFIG=./hosts.json
+```
+
+### `hosts.json` (lista serwerów, NIE commitować)
 
 ```json
 {
-  "type": "module",
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "express": "^4.21.0",
-    "zod": "^3.24.0",
-    "dotenv": "^17.0.0"
+  "hosts": {
+    "production": {
+      "ip": "1.2.3.4",
+      "user": "ubuntu",
+      "key": "main",
+      "description": "Główny serwer"
+    }
+  },
+  "keys": {
+    "main": "/path/to/key.pem"
   }
 }
 ```
 
-Utwórz plik `.env` w katalogu projektu:
+Ścieżki do kluczy mogą używać:
 
-```env
-MCP_USER=admin
-MCP_PASS=twoje-haslo
-MCP_BASE_URL=https://mcp.torweb.pl
+- Absolute paths: `D:/keys/server.pem` lub `D:\\keys\\server.pem`
+- Tilde: `~/keys/server.pem` (rozwijane na `$HOME`/`%USERPROFILE%`)
+- Forward slashes działają na Windows
 
-# GitHub (opcjonalne — tylko jeśli chcesz tool github_api)
-# PAT wygeneruj na https://github.com/settings/tokens (Fine-grained, Contents R/W)
-GITHUB_TOKEN=github_pat_xxxxxxxxxxxxxxxxxxxx
-GITHUB_OWNER=LeszczynskiKarol
-```
+## Wystawianie publicznie (Claude.ai)
 
-⚠️ Dodaj `.env` do `.gitignore`, żeby nie wypchnąć hasła do repo.
+Claude.ai wymaga HTTPS. Setup z FRP + nginx + Let's Encrypt na VPS:
 
----
-
-## Uruchomienie
-
-### 1. MCP server (lokalnie)
-
-```bash
-node server.js
-# MCP on :4500
-```
-
-### 2. Tunel FRP (osobny terminal)
-
-Konfig `frpc-mcp.toml`:
-
-```toml
-serverAddr = "3.68.187.152"
-serverPort = 7000
-auth.method = "token"
-auth.token = "***"
-
-[[proxies]]
-name = "mcp"
-type = "http"
-localPort = 4500
-customDomains = ["mcp.torweb.pl"]
-```
-
-```bash
-cd ~/frp/frp_0.61.1_windows_amd64
-./frpc.exe -c frpc-mcp.toml
-```
-
-### 3. Dodaj connector w Claude.ai
-
-- Settings → Connectors → Add custom connector
-- URL: `https://mcp.torweb.pl/mcp`
-- OAuth Client ID/Secret: **puste**
-- Add → Connect
-- W oknie logowania wpisz `MCP_USER` i `MCP_PASS` z `.env`
-
-W czacie: `+` → Connectors → włącz toggle dla swojego MCP, **i zacznij nową konwersację** (tools podpinają się przy starcie chatu).
-
----
-
-## Konfiguracja serwera publicznego (VPS AWS)
-
-Aby `mcp.torweb.pl` było osiągalne po HTTPS, na serwerze z `frps` potrzebne są:
-
-### A. Rekord DNS (Route 53)
+### 1. DNS
 
 ```
-mcp.torweb.pl    A    3.68.187.152    TTL 300
+mcp.your-domain.com    A    <VPS_IP>    TTL 300
 ```
 
-### B. Vhost nginx — `/etc/nginx/sites-available/mcp.torweb.pl`
+### 2. Vhost nginx na VPS - `/etc/nginx/sites-available/mcp.your-domain.com`
 
 ```nginx
 server {
-    server_name mcp.torweb.pl;
+    server_name mcp.your-domain.com;
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
@@ -151,7 +130,7 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # Dla MCP / SSE
+        # SSE / długie połączenia MCP
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_buffering off;
@@ -163,58 +142,81 @@ server {
 ```
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/mcp.torweb.pl /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/mcp.your-domain.com /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
-sudo certbot --nginx -d mcp.torweb.pl
+sudo certbot --nginx -d mcp.your-domain.com
 ```
 
-### C. `frps.toml` — bez zmian
+### 3. FRP server (`frps`) na VPS
 
-Wystarczy że `vhostHTTPPort = 8080` jest ustawiony i `bindPort = 7000`.
+W `/etc/frp/frps.toml`:
 
----
+```toml
+bindPort = 7000
+vhostHTTPPort = 8080
+auth.method = "token"
+auth.token = "<wspólny token>"
+```
 
-## Test
+### 4. FRP client (`frpc`) na lokalnym Windows
+
+`C:\Users\<user>\frp\frp_0.61.1_windows_amd64\frpc-mcp.toml`:
+
+```toml
+serverAddr = "<VPS_IP>"
+serverPort = 7000
+auth.method = "token"
+auth.token = "<wspólny token z frps>"
+
+[[proxies]]
+name = "mcp"
+type = "http"
+localPort = 4500
+customDomains = ["mcp.your-domain.com"]
+```
+
+### 5. Dodaj connector w Claude.ai
+
+- Settings → Connectors → Add custom connector
+- URL: `https://mcp.your-domain.com/mcp` (z `/mcp` na końcu!)
+- OAuth Client ID/Secret: **puste**
+- Connect → login form → wpisz `MCP_USER` i `MCP_PASS` z `.env`
+- W czacie: `+` → Connectors → włącz toggle → **start nowej konwersacji**
+
+## Uruchomienie (Windows)
+
+### Opcja A: PM2 z auto-reload
 
 ```bash
-curl -i https://mcp.torweb.pl/mcp
+npm install -g pm2 pm2-windows-startup
+pm2-startup install   # autostart po zalogowaniu Windows
+cd D:\mcp-server
+pm2 start server.js --name mcp --watch --ignore-watch=".env node_modules .git *.log dump.pm2 hosts.json"
+pm2 save
 ```
 
-Powinieneś dostać odpowiedź JSON-RPC (np. `406 Not Acceptable` z wymogiem `text/event-stream` — to oczekiwane od curla, Claude.ai wysyła ten nagłówek automatycznie).
+Po tym:
 
----
+- Zmiana `server.js` = auto-restart w 2 sek
+- Crash node = auto-restart
+- Po zalogowaniu Windows = auto-start
 
-## Bezpieczeństwo
+Komendy codzienne:
 
-Server wymaga **autoryzacji hasłem przez OAuth 2.1** (PKCE + Dynamic Client Registration). Claude.ai przy łączeniu otwiera login form, gdzie trzeba podać dane skonfigurowane w `.env`:
-
-```env
-MCP_USER=admin
-MCP_PASS=twoje-haslo
+```bash
+pm2 list                                  # status
+pm2 logs mcp --lines 30 --nostream        # logi (snapshot)
+pm2 restart mcp                           # ręczny restart
 ```
 
-Po zalogowaniu Claude dostaje access token (30 dni ważności) i dopiero z nim ma dostęp do tooli. Bez tokena każde `/mcp` zwraca `401 Unauthorized` z nagłówkiem `WWW-Authenticate` wskazującym na endpoint OAuth discovery.
-
-Klucze `.pem` i tak nigdy nie opuszczają Twojej maszyny — tunel przenosi tylko żądania MCP.
-
-**Dodatkowe zalecenia produkcyjne:**
-
-1. **Whitelist komend** — w `aws_cli` ogranicz do `describe-*` / `list-*`, jeśli nie potrzebujesz mutacji
-2. **Read-only AWS profile** — utwórz osobne IAM credentials tylko do odczytu i ustaw `AWS_PROFILE` przed odpaleniem node'a
-3. **SSH known_hosts** — usuń `StrictHostKeyChecking=no` i dodaj hosty raz ręcznie do `~/.ssh/known_hosts`
-4. **Loguj każdy tool call** do osobnego pliku — audyt + debug
-5. **Persist OAuth state** — obecnie `clients` i `accessTokens` są w pamięci, po restarcie node'a trzeba ponownie się autoryzować w Claude.ai
-
-## Autostart przy starcie Windows
-
-Jeden plik startowy odpala oba procesy — tunel FRP (port 4500 → mcp.torweb.pl) oraz MCP server (`node server.js`).
+### Opcja B: Task Scheduler + bat (bez PM2)
 
 `D:\mcp-server\start-mcp.bat`:
 
 ```bat
 @echo off
 cd /d C:\Users\Admin\frp\frp_0.61.1_windows_amd64
-start "FRP tunnel mcp" /min frpc.exe -c frpc-mcp.toml
+start "FRP tunnel" /min frpc.exe -c frpc-mcp.toml
 
 cd /d D:\mcp-server
 start "MCP server" /min cmd /k "node server.js"
@@ -222,51 +224,65 @@ start "MCP server" /min cmd /k "node server.js"
 
 Task Scheduler → Create Task:
 
-- **General**: nazwa np. `MCP Auto-Start`, Run whether user is logged on or not, Run with highest privileges
-- **Trigger**: At startup (z opóźnieniem 30s żeby sieć/disk się ustabilizowała)
-- **Action**: Program = `D:\mcp-server\start-mcp.bat`
-- **Settings**: If the task fails, restart every 1 minute, do tego 3 razy
+- General: Run with highest privileges, At startup
+- Trigger: At startup (delay 30s)
+- Action: `D:\mcp-server\start-mcp.bat`
 
-> Ten bat odpala **tylko tunel mcp** i node servera — niezależnie od głównego `tunnel` (który nadpisuje `frpc.toml` i służy do frontend/backend). Oba procesy frpc chodzą równolegle, bez kolizji.
+Zmiana `server.js` = ręczny restart przez zabicie node i odpalenie bata.
 
-**Alternatywnie - PM2 dla node servera** (jeśli chcesz że samo się restartuje przy crashu node'a, nie tylko przy crashu całego komputera):
+### FRP tunel - osobny start
 
-```bash
-npm install -g pm2 pm2-windows-startup
-pm2-startup install
-cd D:\mcp-server
-pm2 start server.js --name mcp
-pm2 save
+Niezależnie od wyboru A/B - tunel FRP musi chodzić. Najprościej przez Task Scheduler:
+
+`start-mcp.bat` (jeśli PM2 zarządza node):
+
+```bat
+@echo off
+cd /d C:\Users\Admin\frp\frp_0.61.1_windows_amd64
+start "FRP tunnel mcp" /min frpc.exe -c frpc-mcp.toml
 ```
-
-Jak używasz PM2, w `start-mcp.bat` usuń drugą część (`cd /d D:\mcp-server && start "MCP server"...`) — PM2 sam wystartuje node przy bootcie.
-
----
 
 ## Rozszerzanie
 
-### Dodawanie kolejnego serwera
+### Dodanie nowego hosta
 
-W `server.js` znajdź obiekt `HOSTS` i dorzuć nowy wpis:
+Edytuj `hosts.json`:
 
-```javascript
-const HOSTS = {
-  panel: { ip: "3.67.113.111", user: "ubuntu", key: "maturapolski" },
-  matury: { ip: "3.68.187.152", user: "ubuntu", key: "maturapolski" },
-  nowy: { ip: "1.2.3.4", user: "ubuntu", key: "moja-aplikacja" },
-};
+```json
+{
+  "hosts": {
+    "production": {...},
+    "nowy": {
+      "ip": "5.6.7.8",
+      "user": "ubuntu",
+      "key": "main",
+      "description": "Nowy serwer"
+    }
+  }
+}
 ```
 
-Po tym `postgres_query` i `pm2_status` automatycznie obsłużą alias `nowy`.
+PM2 z `--watch` automatycznie przeładuje. **W Claude.ai zrób disconnect/connect** żeby zauważyć nową opcję w `host` dropdown.
 
-### Dodawanie nowego toola
+### Dodanie nowego klucza SSH
 
-Każdy nowy tool to kilka linii w `server.js`:
+```json
+{
+  "keys": {
+    "main": "/path/to/main.pem",
+    "klient-x": "~/keys/klient-x.pem"
+  }
+}
+```
+
+### Dodanie nowego toola
+
+W `server.js`:
 
 ```javascript
 server.tool(
   "nazwa_tool",
-  "Opis dla Claude — kiedy ma użyć tego narzędzia",
+  "Opis dla Claude - kiedy ma użyć tego narzędzia",
   {
     parametr: z.string().describe("co to za parametr"),
   },
@@ -277,82 +293,59 @@ server.tool(
 );
 ```
 
-Po dodaniu — restart node, **disconnect/connect connector w Claude.ai** żeby zauważył nowe tools.
+Po dodaniu PM2 (z `--watch`) auto-przeładuje. **Disconnect/connect connector** w Claude.ai żeby zobaczyć nowy tool.
 
----
+## Bezpieczeństwo
+
+- OAuth 2.1 z PKCE i Dynamic Client Registration
+- Access tokeny ważne 30 dni (konfigurowalne)
+- Klucze SSH, AWS creds, GitHub PAT zostają lokalnie
+- 401 + `WWW-Authenticate` dla nieautoryzowanych
+
+### Zalecenia produkcyjne
+
+1. **Read-only AWS profile** dla `aws_cli` jeśli nie potrzebujesz mutacji - osobne IAM credentials
+2. **Whitelist komend** w `aws_cli` (np. tylko `describe-*`, `list-*`)
+3. **Usuń `StrictHostKeyChecking=no`** z `ssh_exec` i dodaj hosty raz do `known_hosts`
+4. **Audit log** - każdy tool call do osobnego pliku z timestamp + user
+5. **Persist OAuth state** - obecnie tokeny są w pamięci, restart node = nowa autoryzacja
+6. **Rate limiting** na endpointy `/oauth/*` (np. express-rate-limit)
+7. **`.gitignore`** - sprawdź czy zawiera `.env`, `hosts.json`, `dump.pm2`, `node_modules`, `*.log`
 
 ## Troubleshooting
 
-| Objaw                                       | Przyczyna                                            | Rozwiązanie                                                  |
-| ------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------ |
-| `Couldn't reach the MCP server`             | Zły URL (bez `/mcp`)                                 | Użyj `https://mcp.torweb.pl/mcp`                             |
-| `404 Not Found` od nginx                    | Brak vhost dla subdomeny                             | Stwórz `/etc/nginx/sites-available/mcp.torweb.pl` + certbot  |
-| `502 Bad Gateway`                           | nginx → frps OK, ale frps nie ma tunelu na tę domenę | Sprawdź czy `./frpc.exe -c frpc-mcp.toml` chodzi             |
-| `connection refused` w logach frps          | `node server.js` nie chodzi                          | Odpal node                                                   |
-| Claude widzi connector, ale nie widzi tools | Toggle wyłączony w czacie                            | `+` → Connectors → włącz toggle, **start nowej konwersacji** |
-
----
-
-## Przykłady użycia w czacie Claude
-
-**Diagnostyka AWS:**
-
-- _"Wylistuj instancje EC2 w eu-central-1 razem ze statusem"_
-- _"Sprawdź obciążenie CPU instancji `i-0c621a1c7abc9e4f7` z ostatnich 24h przez CloudWatch"_
-
-**SSH na EC2:**
-
-- _"Zaloguj się na 3.67.113.111 i pokaż `pm2 list`"_
-- _"Sprawdź ile wolnego miejsca na obu serwerach (`df -h`)"_
-
-**Lokalna robota:**
-
-- _"Otwórz `D:\\maturapolski\\src\\index.ts`, znajdź funkcję X i napraw bug Y, zacommituj"_
-- _"Pobierz najnowsze zmiany z mojego repo GitHub i odpal `npm install`"_
-
-**GitHub:**
-
-- _"Wylistuj otwarte issue w repo maturapolski"_
-- _"Pokaż commits w main z ostatniego tygodnia"_
-- _"Utwórz nowego brancha `fix/login-bug` z aktualnego maina"_
-
-**Postgres bez logowania do bazy:**
-
-- _"Ile użytkowników zarejestrowało się dzisiaj w maturapolski?"_ → `postgres_query host=panel database=maturapolski query="SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '1 day'"`
-- _"Pokaż 10 ostatnich błędów płatności w bazie panel_torweb"_
-- _"Jaka jest wielkość tabeli `arkusze` w bazie maturapolski?"_
-
-**PM2 - szybka diagnoza:**
-
-- _"Co działa na panel.torweb.pl?"_ → `pm2_status host=panel`
-- _"Pokaż ostatnie 100 linii logów aplikacji `maturapolski-api` na serwerze panel"_ → `pm2_status host=panel app=maturapolski-api lines=100`
-- _"Sprawdź czy wszystkie procesy pm2 są w stanie 'online' na obu serwerach"_
-
-**End-to-end (4 narzędzia naraz):**
-
-- _"Backend na panel.torweb.pl zwraca 502. Zdiagnozuj, popraw kod lokalnie, zacommituj, wdróż na serwer."_  
-   → ssh_exec sprawdzi logi → local_exec edytuje plik → local_exec robi git commit/push → github_api opcjonalnie PR → ssh_exec pull/restart.
-
----
+| Objaw                                           | Przyczyna                                                | Rozwiązanie                                                                                                        |
+| ----------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `Couldn't reach the MCP server` w Claude.ai     | URL bez `/mcp`                                           | Użyj `https://domena/mcp` (z suffix)                                                                               |
+| `404 Not Found` od nginx                        | Brak vhost dla subdomeny                                 | Stwórz vhost + certbot                                                                                             |
+| `502 Bad Gateway`                               | frpc nie chodzi albo node padł                           | Sprawdź `pm2 list` i process frpc                                                                                  |
+| `connect EPERM \\.\pipe\rpc.sock`               | PM2 daemon corrupted                                     | `rm -rf ~/.pm2 && npm uninstall -g pm2 && npm install -g pm2`                                                      |
+| `EADDRINUSE :4500`                              | Inny node chodzi na 4500                                 | `Get-Process node \| Stop-Process -Force` w PowerShell admin                                                       |
+| `MCP_PASS - hasło do logowania` przy starcie    | Brak `.env`                                              | `cp .env.example .env` i wypełnij                                                                                  |
+| `hosts.json not loaded`                         | Brak `hosts.json`                                        | `cp hosts.example.json hosts.json` i wypełnij                                                                      |
+| `Nieznany klucz 'xxx'` przy SSH                 | Klucz nie w `hosts.json`                                 | Dodaj do sekcji `keys`                                                                                             |
+| `ssh_exec` daje "Permission denied (publickey)" | Zły user dla hosta                                       | W `hosts.json` ustaw poprawnego usera (zwykle `ubuntu` dla Ubuntu, `ec2-user` dla Amazon Linux)                    |
+| `pm2: command not found` przez `pm2_status`     | NVM na zdalnym - non-interactive shell nie ładuje nvm.sh | Tool radzi sobie z tym automatycznie (sourcing nvm.sh przez base64). Sprawdź czy na hoście jest nvm w `$HOME/.nvm` |
+| Claude widzi connector ale nie tools            | Toggle wyłączony albo stara sesja                        | `+` → Connectors → włącz toggle → **nowa konwersacja**                                                             |
+| Zmieniłeś tools, Claude pokazuje stare          | Cache schemy MCP                                         | Settings → Connectors → Disconnect → Connect                                                                       |
 
 ## Pliki w projekcie
 
 ```
-D:\mcp-server
+mcp-server/
 ├── server.js              # MCP server (Express + StreamableHTTP + OAuth)
 ├── package.json
-├── package-lock.json
-├── .env                   # MCP_USER, MCP_PASS, GITHUB_TOKEN, GITHUB_OWNER (NIE commitować!)
-├── .env.example           # szablon do skopiowania
+├── .env                   # (gitignore) - sekrety
+├── .env.example
+├── hosts.json             # (gitignore) - lista serwerów
+├── hosts.example.json
 ├── .gitignore
 ├── README.md
-├── start-mcp.bat          # odpala FRP tunnel + node server (autostart)
-└── node_modules\
-C:\Users\Admin\frp\frp_0.61.1_windows_amd64
-└── frpc-mcp.toml          # osobny config tunela mcp (port 4500 → mcp.torweb.pl)
-
+├── setup.bat              # quick start dla Windows
+├── setup.sh               # quick start dla Linux/Mac
+└── start-mcp.bat          # autostart FRP tunnel (Windows)
 ```
 
-restart lokalnie:
+## License
 
-Get-WmiObject Win32*Process -Filter "Name='node.exe'" | Where-Object { $*.CommandLine -like "_mcp-server\server.js_" } | ForEach-Object { Stop-Process -Id $\_.ProcessId -Force }; Start-Sleep 2; Start-Process -FilePath "D:\mcp-server\start-mcp.bat" -WindowStyle Minimized
+MIT

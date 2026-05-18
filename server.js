@@ -8,23 +8,60 @@ import { promisify } from "util";
 import { z } from "zod";
 import crypto from "crypto";
 import fs from "fs/promises";
+import fsSync from "fs";
 import path from "path";
 import { config } from "dotenv";
 config();
 
+// === Wczytaj hosts.json ===
+const HOSTS_CONFIG_PATH =
+  process.env.HOSTS_CONFIG || path.join(process.cwd(), "hosts.json");
+let HOSTS_CONFIG = { hosts: {}, keys: {} };
+try {
+  const raw = fsSync.readFileSync(HOSTS_CONFIG_PATH, "utf8");
+  HOSTS_CONFIG = JSON.parse(raw);
+  console.log(
+    `Loaded ${Object.keys(HOSTS_CONFIG.hosts || {}).length} hosts and ${Object.keys(HOSTS_CONFIG.keys || {}).length} keys from ${HOSTS_CONFIG_PATH}`,
+  );
+} catch (e) {
+  console.warn(
+    `hosts.json not loaded (${e.code || e.message}). Tools ssh_exec/postgres_query/pm2_status won't work until you create ${HOSTS_CONFIG_PATH}`,
+  );
+}
+
+// === KONFIGURACJA z env ===
 const OAUTH_USER = process.env.MCP_USER || "admin";
 const OAUTH_PASS = process.env.MCP_PASS;
-const BASE_URL = process.env.MCP_BASE_URL || "https://mcp.torweb.pl";
+const BASE_URL = process.env.MCP_BASE_URL;
+const PORT = parseInt(process.env.PORT || "4500", 10);
+const SERVER_NAME = process.env.MCP_SERVER_NAME || "mcp-server";
+const TOKEN_TTL_MS =
+  parseInt(process.env.TOKEN_TTL_SECONDS || "2592000", 10) * 1000;
+const AUTH_CODE_TTL_MS =
+  parseInt(process.env.AUTH_CODE_TTL_SECONDS || "600", 10) * 1000;
+const EXEC_BUFFER =
+  parseInt(process.env.EXEC_BUFFER_MB || "10", 10) * 1024 * 1024;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_OWNER = process.env.GITHUB_OWNER || "";
 
-if (!OAUTH_PASS) {
-  console.error("❌ Brak MCP_PASS w .env");
+// Walidacja wymaganych
+const errors = [];
+if (!OAUTH_PASS) errors.push("MCP_PASS - hasło do logowania OAuth");
+if (!BASE_URL) errors.push("MCP_BASE_URL - np. https://your-domain.com");
+if (errors.length) {
+  console.error("Brak wymaganych zmiennych w .env:");
+  errors.forEach((e) => console.error("  - " + e));
+  console.error("Skopiuj .env.example do .env i wypełnij.");
   process.exit(1);
 }
 
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const GITHUB_OWNER = process.env.GITHUB_OWNER || "";
 if (!GITHUB_TOKEN)
-  console.warn("⚠️ Brak GITHUB_TOKEN - tool github_api nie zadziała");
+  console.warn("GITHUB_TOKEN nie ustawiony - tool github_api nie zadziała");
+
+console.log(`MCP server: ${SERVER_NAME}`);
+console.log(`Base URL: ${BASE_URL}`);
+console.log(`Port: ${PORT}`);
+console.log(`Token TTL: ${TOKEN_TTL_MS / 1000 / 86400} days`);
 
 const clients = new Map(); // client_id -> { client_secret, redirect_uris }
 const authCodes = new Map(); // code -> { client_id, redirect_uri, expires }
@@ -32,7 +69,7 @@ const accessTokens = new Map(); // access_token -> { client_id, expires }
 
 const execAsync = promisify(exec);
 
-const server = new McpServer({ name: "aws-ssh", version: "1.0.0" });
+const server = new McpServer({ name: SERVER_NAME, version: "1.0.0" });
 
 server.tool(
   "aws_cli",
@@ -44,7 +81,7 @@ server.tool(
   },
   async ({ command }) => {
     const { stdout, stderr } = await execAsync(`aws ${command}`, {
-      maxBuffer: 10 * 1024 * 1024,
+      maxBuffer: EXEC_BUFFER,
     });
     return { content: [{ type: "text", text: stdout || stderr }] };
   },
@@ -52,23 +89,33 @@ server.tool(
 
 server.tool(
   "ssh_exec",
-  "SSH do EC2 przez klucz .pem",
+  "SSH do dowolnego hosta używając klucza zdefiniowanego w hosts.json (sekcja 'keys'). Hostname jako string (IP lub DNS), user jako string (default ubuntu).",
   {
-    key: z.enum(["maturapolski", "moja-aplikacja"]),
-    user: z.string().default("ec2-user"),
-    host: z.string(),
+    key: z
+      .string()
+      .describe("nazwa klucza z hosts.json (np. 'main', 'maturapolski')"),
+    user: z.string().default("ubuntu"),
+    host: z
+      .string()
+      .describe("IP albo DNS, np. '3.67.113.111' albo 'example.com'"),
     command: z.string(),
   },
   async ({ key, user, host, command }) => {
-    const keyPath =
-      key === "maturapolski"
-        ? "D:\\maturapolski\\maturapolski-key.pem"
-        : "D:\\maturapolski\\moja-aplikacja-key-pair.pem";
-    const { stdout, stderr } = await execAsync(
-      `ssh -i "${keyPath}" -o StrictHostKeyChecking=no ${user}@${host} "${command.replace(/"/g, '\\"')}"`,
-      { maxBuffer: 10 * 1024 * 1024 },
-    );
-    return { content: [{ type: "text", text: stdout || stderr }] };
+    try {
+      const keyPath = resolveKeyPath(key);
+      const { stdout, stderr } = await execAsync(
+        `ssh -i "${keyPath}" -o StrictHostKeyChecking=no ${user}@${host} "${command.replace(/"/g, '\\"')}"`,
+        { maxBuffer: EXEC_BUFFER },
+      );
+      return { content: [{ type: "text", text: stdout || stderr }] };
+    } catch (e) {
+      return {
+        content: [
+          { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+        ],
+        isError: true,
+      };
+    }
   },
 );
 
@@ -89,7 +136,7 @@ server.tool(
   async ({ command, cwd }) => {
     try {
       const { stdout, stderr } = await execAsync(command, {
-        maxBuffer: 10 * 1024 * 1024,
+        maxBuffer: EXEC_BUFFER,
         cwd: cwd || undefined,
         shell: "cmd.exe",
       });
@@ -163,7 +210,7 @@ server.tool(
           Authorization: `Bearer ${GITHUB_TOKEN}`,
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
-          "User-Agent": "mcp-aws-ssh",
+          "User-Agent": SERVER_NAME,
           ...(body ? { "Content-Type": "application/json" } : {}),
         },
         ...(body ? { body: JSON.stringify(body) } : {}),
@@ -190,23 +237,31 @@ server.tool(
   },
 );
 
-// Mapowanie hostów - rozszerz wg potrzeb
-const HOSTS = {
-  panel: { ip: "3.67.113.111", user: "ubuntu", key: "maturapolski" },
-  matury: { ip: "3.68.187.152", user: "ubuntu", key: "maturapolski" },
-};
+function resolveKeyPath(keyName) {
+  const p = (HOSTS_CONFIG.keys || {})[keyName];
+  if (!p)
+    throw new Error(
+      `Nieznany klucz '${keyName}'. Dostępne: ${Object.keys(HOSTS_CONFIG.keys || {}).join(", ") || "(hosts.json nie wczytany)"}`,
+    );
+  // Cross-platform path normalization: tilde, forward slashes
+  let resolved = p;
+  if (resolved.startsWith("~/") || resolved.startsWith("~\\")) {
+    resolved = path.join(
+      process.env.HOME || process.env.USERPROFILE || "",
+      resolved.slice(2),
+    );
+  }
+  return path.normalize(resolved);
+}
 
 function buildSsh(hostKey) {
-  const h = HOSTS[hostKey];
+  const h = (HOSTS_CONFIG.hosts || {})[hostKey];
   if (!h)
     throw new Error(
-      `Nieznany host '${hostKey}'. Dostępne: ${Object.keys(HOSTS).join(", ")}`,
+      `Nieznany host '${hostKey}'. Dostępne: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(hosts.json nie wczytany)"}`,
     );
-  const keyPath =
-    h.key === "maturapolski"
-      ? "D:\\maturapolski\\maturapolski-key.pem"
-      : "D:\\maturapolski\\moja-aplikacja-key-pair.pem";
-  return `ssh -i "${keyPath}" -o StrictHostKeyChecking=no ${h.user}@${h.ip}`;
+  const user = h.user || "ubuntu";
+  return `ssh -i "${resolveKeyPath(h.key)}" -o StrictHostKeyChecking=no ${user}@${h.ip}`;
 }
 
 server.tool(
@@ -214,8 +269,10 @@ server.tool(
   "Wykonuje zapytanie SQL na bazie PostgreSQL przez SSH na konkretnym serwerze. Host: 'panel' (panel.torweb.pl, 3.67.113.111). Używa psql przez sudo -u postgres, więc bez hasła. SELECT zwraca dane, inne komendy DML/DDL też działają (UWAGA: produkcja, nie testuj).",
   {
     host: z
-      .enum(["panel", "matury"])
-      .describe("który serwer - panel albo matury"),
+      .string()
+      .describe(
+        `który serwer - dostępne z hosts.json: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(brak)"}`,
+      ),
     database: z
       .string()
       .describe("nazwa bazy, np. 'maturapolski' albo 'panel_torweb'"),
@@ -240,7 +297,7 @@ server.tool(
       // psql przez sudo -u postgres -d <db> -c '<query>'
       const cmd = `${ssh} "cd /tmp && sudo -u postgres psql -d ${database} ${fmtFlag} -c '${sqlEscaped}'"`;
       const { stdout, stderr } = await execAsync(cmd, {
-        maxBuffer: 10 * 1024 * 1024,
+        maxBuffer: EXEC_BUFFER,
       });
       const out = stdout || stderr || "(no output)";
       return { content: [{ type: "text", text: out }] };
@@ -259,7 +316,11 @@ server.tool(
   "pm2_status",
   "Pokazuje status pm2 (lista procesów + opcjonalnie ostatnie logi) na wybranym serwerze EC2. Użyj do szybkiej diagnozy: 'pm2_status host=panel' albo z logami 'pm2_status host=matury app=mojaapka lines=100'.",
   {
-    host: z.enum(["panel", "matury"]).describe("który serwer"),
+    host: z
+      .string()
+      .describe(
+        `który serwer - dostępne z hosts.json: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(brak)"}`,
+      ),
     app: z
       .string()
       .optional()
@@ -297,7 +358,7 @@ server.tool(
       const outputs = [];
       for (const cmd of parts) {
         const { stdout, stderr } = await execAsync(cmd, {
-          maxBuffer: 10 * 1024 * 1024,
+          maxBuffer: EXEC_BUFFER,
         });
         outputs.push(stdout || stderr || "(no output)");
       }
@@ -650,7 +711,7 @@ app.post(
       redirect_uri,
       code_challenge,
       code_challenge_method,
-      expires: Date.now() + 600000, // 10 min
+      expires: Date.now() + AUTH_CODE_TTL_MS,
     });
     const url = new URL(redirect_uri);
     url.searchParams.set("code", code);
@@ -677,16 +738,16 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
     const new_rt = crypto.randomBytes(32).toString("hex");
     accessTokens.set(new_at, {
       client_id,
-      expires: Date.now() + 30 * 24 * 3600 * 1000,
+      expires: Date.now() + TOKEN_TTL_MS,
     });
     const refResp = {
       access_token: new_at,
       token_type: "Bearer",
-      expires_in: 30 * 24 * 3600,
+      expires_in: Math.floor(TOKEN_TTL_MS / 1000),
       refresh_token: new_rt,
       scope: "mcp",
     };
-    console.log("  REFRESH response:", JSON.stringify(refResp));
+    console.log("  REFRESH issued for client:", client_id);
     return res.json(refResp);
   }
 
@@ -735,17 +796,22 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
   const refresh_token = crypto.randomBytes(32).toString("hex");
   accessTokens.set(access_token, {
     client_id,
-    expires: Date.now() + 30 * 24 * 3600 * 1000, // 30 dni
+    expires: Date.now() + TOKEN_TTL_MS, // 30 dni
   });
   const response = {
     access_token,
     token_type: "Bearer",
-    expires_in: 30 * 24 * 3600,
+    expires_in: Math.floor(TOKEN_TTL_MS / 1000),
     refresh_token,
     scope: "mcp",
   };
-  console.log("  TOKEN response:", JSON.stringify(response));
+  console.log(
+    "  TOKEN issued for client:",
+    client_id,
+    "expires_in:",
+    response.expires_in,
+  );
   res.json(response);
 });
 
-app.listen(4500, () => console.log("MCP on :4500"));
+app.listen(PORT, () => console.log(`MCP listening on :${PORT}`));
