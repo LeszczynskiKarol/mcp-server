@@ -7,17 +7,23 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { z } from "zod";
 import crypto from "crypto";
+import { config } from "dotenv";
+config();
 
-const OAUTH_USER = "admin";
-const OAUTH_PASS = "*****"; // tylko Ty będziesz to znać
-const BASE_URL = "https://mcp.torweb.pl";
+const OAUTH_USER = process.env.MCP_USER || "admin";
+const OAUTH_PASS = process.env.MCP_PASS;
+const BASE_URL = process.env.MCP_BASE_URL || "https://mcp.torweb.pl";
+
+if (!OAUTH_PASS) {
+  console.error("❌ Brak MCP_PASS w .env");
+  process.exit(1);
+}
 
 const clients = new Map(); // client_id -> { client_secret, redirect_uris }
 const authCodes = new Map(); // code -> { client_id, redirect_uri, expires }
 const accessTokens = new Map(); // access_token -> { client_id, expires }
 
 const execAsync = promisify(exec);
-const TOKEN = "Basketball321**"; // prosta autoryzacja
 
 const server = new McpServer({ name: "aws-ssh", version: "1.0.0" });
 
