@@ -236,7 +236,7 @@ server.tool(
       const fmtFlag =
         format === "csv" ? "--csv" : format === "json" ? "-A -t" : "";
       // psql przez sudo -u postgres -d <db> -c '<query>'
-      const cmd = `${ssh} "sudo -u postgres psql -d ${database} ${fmtFlag} -c '${sqlEscaped}'"`;
+      const cmd = `${ssh} "cd /tmp && sudo -u postgres psql -d ${database} ${fmtFlag} -c '${sqlEscaped}'"`;
       const { stdout, stderr } = await execAsync(cmd, {
         maxBuffer: 10 * 1024 * 1024,
       });
