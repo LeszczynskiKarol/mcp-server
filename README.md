@@ -4,6 +4,9 @@
 >
 > Give Claude direct access to your AWS account, SSH into your servers, run shell commands on your laptop, query your databases, and manage PM2 processes — all from a Claude chat. **No Claude Code subscription needed. Your keys never leave your machine.**
 
+![All 9 tools available as a Claude.ai custom connector](screenshots/connectors.png)
+*All 9 tools live in your Claude.ai sidebar - no Desktop install, no separate client, just a custom connector.*
+
 [![CI](https://github.com/LeszczynskiKarol/mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/LeszczynskiKarol/mcp-server/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org/)
@@ -72,6 +75,40 @@ This project is the **third option**: your own MCP server, your keys, your serve
 | `book_split` | Split a large text file into ~3000-word chunks |
 | `book_chunk` | Read one chunk from a directory created by `book_split` |
 | `book_note` | Manage JSON notes for iterative work on long documents |
+
+---
+
+## See it in action
+
+Real examples from a real Claude.ai chat using this MCP server.
+
+### Check PM2 process health across servers
+
+> *"Check the status of all PM2 processes on my panel server and give me a quick health summary"*
+
+![Claude shows PM2 process status with table and health summary](screenshots/1chat.png)
+
+Claude calls `pm2_status`, formats the output as a clean table, and flags processes worth watching (high restart counts, recent restarts, elevated memory).
+
+### List EC2 instances in any region
+
+> *"Using AWS CLI, list all my EC2 instances in eu-central-1 with their IDs, types, and state"*
+
+![EC2 instance inventory rendered as a clean table](screenshots/10chat.png)
+
+Claude calls `aws_cli` with a `describe-instances --query ...` filter, then parses the JSON and renders it as a markdown table with running/stopped status indicators.
+
+### Query PostgreSQL databases over SSH
+
+> *"List all tables in my smart_edu database, then count rows in the 3 biggest ones"*
+
+![Postgres query call with smart_edu database](screenshots/6chat.png)
+
+Two tools work together here: `ssh_exec` to enumerate databases when the first guess misses, then `postgres_query` against the right one.
+
+![Database list and user counts across multiple databases](screenshots/3chat.png)
+
+Claude lists every database on the host, identifies the ones with a `users` table, and runs `COUNT(*)` queries in parallel.
 
 ---
 
