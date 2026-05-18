@@ -186,15 +186,15 @@ server.tool(
         isError: true,
       };
 
-    // auto-prefix ownera jeśli krótki shortcut "/repos/nazwa-repo/..."
+    // auto-prefix owner if shortcut form "/repos/repo-name/..."
     let ep = endpoint.startsWith("/") ? endpoint : "/" + endpoint;
     const shortMatch = ep.match(/^\/repos\/([^\/]+)(\/.*)?$/);
     if (shortMatch && !shortMatch[1].includes("/") && GITHUB_OWNER) {
-      // sprawdź czy to nie jest już owner/repo (czyli jest druga ukośnik wewnątrz pierwszego segmentu)
+      // check if it's already owner/repo (i.e. second slash inside the first segment)
       const parts = ep.split("/");
       // /repos/X/Y/... -> parts = ["", "repos", "X", "Y", ...]
-      // jeśli parts[3] istnieje i nie ma kropki (nazwa repo), to znaczy że X jest ownerem i Y jest repo
-      // jeśli parts[3] nie istnieje albo wygląda na sub-resource, X jest skrótem nazwy repo
+      // if parts[3] exists and looks like a repo name, X is the owner and Y is the repo
+      // if parts[3] is missing or looks like a sub-resource, X is a repo-name shortcut
       if (parts.length < 4) {
         ep = `/repos/${GITHUB_OWNER}/${parts[2]}`;
       }
