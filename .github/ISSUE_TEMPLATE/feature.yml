@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest a new tool or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Concrete use cases help much more than abstract requests.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What would you like?
+      description: Describe the feature, new tool, or improvement
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: When would you use this? A real-world example helps a lot.
+      placeholder: |
+        Example: I want a `s3_upload` tool so I can ask Claude to upload generated
+        files from local disk to my S3 bucket without leaving the chat.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you tried existing tools (`aws_cli`, `local_exec`)? Why aren't they enough?
+    validations:
+      required: false

@@ -1,0 +1,80 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill in the sections below — the more context,
+        the faster we can help. **Redact secrets (tokens, passwords) before pasting logs.**
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you try to do, and what went wrong?
+      placeholder: |
+        I tried to connect Claude.ai to the MCP server, but the connector page shows
+        "Couldn't reach the MCP server".
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: I expected the connector to show "Connected" and tools to be available in chat.
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Output from `pm2 logs mcp --lines 50 --nostream` or the terminal where you ran
+        `node server.js`. **REDACT SECRETS** — replace tokens with `[REDACTED]`.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node version
+      description: Output of `node --version`
+      placeholder: v22.0.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: client
+    attributes:
+      label: MCP client
+      options:
+        - Claude.ai (web)
+        - Claude Desktop
+        - Custom MCP client
+        - Other (specify below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Windows
+        - macOS
+        - Linux (Ubuntu/Debian)
+        - Linux (other)
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Screenshots, related issues, ideas about the cause, etc.
+    validations:
+      required: false
