@@ -1,6 +1,6 @@
-# MCP Server — AWS CLI + SSH
+# MCP Server — AWS CLI + SSH + Local + GitHub
 
-Lokalny MCP server, który daje Claude.ai (lub innemu klientowi MCP) bezpośredni dostęp do **AWS CLI** oraz **SSH na instancje EC2 przez klucze .pem** — bez kopiowania promptów i bez Claude Code.
+Lokalny MCP server, który daje Claude.ai (lub innemu klientowi MCP) bezpośredni dostęp do **AWS CLI**, **SSH na instancje EC2 przez klucze .pem**, **lokalnego shella Windows** oraz **GitHub REST API** — bez kopiowania promptów i bez Claude Code.
 
 Server chodzi lokalnie na Windowsie. Wystawia się go publicznie przez tunel HTTPS (frp + nginx + Let's Encrypt na osobnym VPS). Claude.ai łączy się z nim jako Custom Connector i może wywoływać polecenia jakby siedział na Twoim kompie.
 
@@ -26,12 +26,14 @@ Server chodzi lokalnie na Windowsie. Wystawia się go publicznie przez tunel HTT
 
 ## Co to robi
 
-Wystawia dwa narzędzia MCP, których Claude może użyć w czacie:
+Wystawia cztery narzędzia MCP, których Claude może użyć w czacie:
 
 - **`aws_cli`** — wykonuje dowolne polecenie AWS CLI używając lokalnego profilu (`aws ec2 describe-instances ...`)
-- **`ssh_exec`** — wykonuje polecenie po SSH na wskazanym hoście, używając jednego z dwóch kluczy `.pem`
+- **`ssh_exec`** — wykonuje polecenie po SSH na wskazanym hoście, używając jednego z dwóch kluczy `.pem` (`maturapolski` lub `moja-aplikacja`)
+- **`local_exec`** — wykonuje dowolne polecenie shell (`cmd.exe`) na lokalnym Windowsie. Edycja plików, git, npm, pm2 lokalny, dowolny soft.
+- **`github_api`** — wykonuje request do GitHub REST API używając Personal Access Token. Issues, PRs, commits, contents, workflows.
 
-Klucze `.pem` **nigdy nie opuszczają Twojej maszyny**. Tunel przenosi tylko żądania MCP (komendy do wykonania) i ich wyniki.
+Klucze `.pem` i GitHub PAT **nigdy nie opuszczają Twojej maszyny**. Tunel przenosi tylko żądania MCP (komendy do wykonania) i ich wyniki.
 
 ---
 
@@ -71,6 +73,11 @@ Utwórz plik `.env` w katalogu projektu:
 MCP_USER=admin
 MCP_PASS=twoje-haslo
 MCP_BASE_URL=https://mcp.torweb.pl
+
+# GitHub (opcjonalne — tylko jeśli chcesz tool github_api)
+# PAT wygeneruj na https://github.com/settings/tokens (Fine-grained, Contents R/W)
+GITHUB_TOKEN=github_pat_xxxxxxxxxxxxxxxxxxxx
+GITHUB_OWNER=LeszczynskiKarol
 ```
 
 ⚠️ Dodaj `.env` do `.gitignore`, żeby nie wypchnąć hasła do repo.
@@ -112,10 +119,11 @@ cd ~/frp/frp_0.61.1_windows_amd64
 
 - Settings → Connectors → Add custom connector
 - URL: `https://mcp.torweb.pl/mcp`
-- OAuth Client ID/Secret: **puste** (server nie używa OAuth)
+- OAuth Client ID/Secret: **puste**
 - Add → Connect
+- W oknie logowania wpisz `MCP_USER` i `MCP_PASS` z `.env`
 
-W czacie: `+` → Connectors → włącz toggle dla swojego MCP.
+W czacie: `+` → Connectors → włącz toggle dla swojego MCP, **i zacznij nową konwersację** (tools podpinają się przy starcie chatu).
 
 ---
 
@@ -195,19 +203,31 @@ Klucze `.pem` i tak nigdy nie opuszczają Twojej maszyny — tunel przenosi tylk
 4. **Loguj każdy tool call** do osobnego pliku — audyt + debug
 5. **Persist OAuth state** — obecnie `clients` i `accessTokens` są w pamięci, po restarcie node'a trzeba ponownie się autoryzować w Claude.ai
 
-**Zalecenia produkcyjne:**
-
-1. **Whitelist komend** — w `aws_cli` ogranicz do `describe-*` / `list-*`, jeśli nie potrzebujesz mutacji
-2. **Read-only AWS profile** — utwórz osobne IAM credentials tylko do odczytu i ustaw `AWS_PROFILE` przed odpaleniem nodea
-3. **SSH known_hosts** — usuń `StrictHostKeyChecking=no` i dodaj hosty raz ręcznie do `~/.ssh/known_hosts`
-4. **Basic auth w nginx** dla `mcp.torweb.pl` jeśli URL kiedyś wycieknie
-5. **Loguj każdy tool call** do osobnego pliku — audyt + debug
-
----
-
 ## Autostart przy starcie Windows
 
-### MCP server przez PM2
+Jeden plik startowy odpala oba procesy — tunel FRP (port 4500 → mcp.torweb.pl) oraz MCP server (`node server.js`).
+
+`D:\mcp-server\start-mcp.bat`:
+
+```bat
+@echo off
+cd /d C:\Users\Admin\frp\frp_0.61.1_windows_amd64
+start "FRP tunnel mcp" /min frpc.exe -c frpc-mcp.toml
+
+cd /d D:\mcp-server
+start "MCP server" /min cmd /k "node server.js"
+```
+
+Task Scheduler → Create Task:
+
+- **General**: nazwa np. `MCP Auto-Start`, Run whether user is logged on or not, Run with highest privileges
+- **Trigger**: At startup (z opóźnieniem 30s żeby sieć/disk się ustabilizowała)
+- **Action**: Program = `D:\mcp-server\start-mcp.bat`
+- **Settings**: If the task fails, restart every 1 minute, do tego 3 razy
+
+> Ten bat odpala **tylko tunel mcp** i node servera — niezależnie od głównego `tunnel` (który nadpisuje `frpc.toml` i służy do frontend/backend). Oba procesy frpc chodzą równolegle, bez kolizji.
+
+**Alternatywnie - PM2 dla node servera** (jeśli chcesz że samo się restartuje przy crashu node'a, nie tylko przy crashu całego komputera):
 
 ```bash
 npm install -g pm2 pm2-windows-startup
@@ -217,31 +237,7 @@ pm2 start server.js --name mcp
 pm2 save
 ```
 
-### Tunel FRP przez Task Scheduler
-
-`C:\Users\Admin\frp\frp_0.61.1_windows_amd64\start-mcp.bat`:
-
-```bat
-@echo off
-cd /d C:\Users\Admin\frp\frp_0.61.1_windows_amd64
-start "" /min frpc.exe -c frpc-mcp.toml
-```
-
-Task Scheduler → Create Task:
-
-- **General**: Run whether user is logged on or not, highest privileges
-- **Trigger**: At startup
-- **Action**: Program = `C:\Users\Admin\frp\frp_0.61.1_windows_amd64\start-mcp.bat`
-- **Settings**: Restart on failure (1 min, 3 razy)
-
-> Ten bat odpala **tylko tunel mcp** — niezależnie od głównego `tunnel` (który nadpisuje `frpc.toml` i służy do frontend/backend). Oba procesy frpc chodzą równolegle, bez kolizji.
-
-Task Scheduler → Create Task:
-
-- **General**: Run whether user is logged on or not, highest privileges
-- **Trigger**: At startup
-- **Action**: Program = ścieżka do `start-mcp.bat`
-- **Settings**: Restart on failure (1 min, 3 razy)
+Jak używasz PM2, w `start-mcp.bat` usuń drugą część (`cd /d D:\mcp-server && start "MCP server"...`) — PM2 sam wystartuje node przy bootcie.
 
 ---
 
@@ -279,14 +275,50 @@ Po dodaniu — restart node, **disconnect/connect connector w Claude.ai** żeby 
 
 ---
 
+## Przykłady użycia w czacie Claude
+
+**Diagnostyka AWS:**
+
+- _"Wylistuj instancje EC2 w eu-central-1 razem ze statusem"_
+- _"Sprawdź obciążenie CPU instancji `i-0c621a1c7abc9e4f7` z ostatnich 24h przez CloudWatch"_
+
+**SSH na EC2:**
+
+- _"Zaloguj się na 3.67.113.111 i pokaż `pm2 list`"_
+- _"Sprawdź ile wolnego miejsca na obu serwerach (`df -h`)"_
+
+**Lokalna robota:**
+
+- _"Otwórz `D:\\maturapolski\\src\\index.ts`, znajdź funkcję X i napraw bug Y, zacommituj"_
+- _"Pobierz najnowsze zmiany z mojego repo GitHub i odpal `npm install`"_
+
+**GitHub:**
+
+- _"Wylistuj otwarte issue w repo maturapolski"_
+- _"Pokaż commits w main z ostatniego tygodnia"_
+- _"Utwórz nowego brancha `fix/login-bug` z aktualnego maina"_
+
+**End-to-end (4 narzędzia naraz):**
+
+- _"Backend na panel.torweb.pl zwraca 502. Zdiagnozuj, popraw kod lokalnie, zacommituj, wdróż na serwer."_  
+   → ssh_exec sprawdzi logi → local_exec edytuje plik → local_exec robi git commit/push → github_api opcjonalnie PR → ssh_exec pull/restart.
+
+---
+
 ## Pliki w projekcie
 
 ```
 D:\mcp-server
-├── server.js         # MCP server (Express + StreamableHTTP transport)
+├── server.js              # MCP server (Express + StreamableHTTP + OAuth)
 ├── package.json
-├── .env              # MCP_USER, MCP_PASS, MCP_BASE_URL (nie commitować!)
+├── package-lock.json
+├── .env                   # MCP_USER, MCP_PASS, GITHUB_TOKEN, GITHUB_OWNER (NIE commitować!)
+├── .env.example           # szablon do skopiowania
 ├── .gitignore
-├── node_modules
-└── frpc-mcp.toml     # osobny config tunela dla mcp (port 4500 → mcp.torweb.pl)
+├── README.md
+├── start-mcp.bat          # odpala FRP tunnel + node server (autostart)
+└── node_modules\
+C:\Users\Admin\frp\frp_0.61.1_windows_amd64
+└── frpc-mcp.toml          # osobny config tunela mcp (port 4500 → mcp.torweb.pl)
+
 ```
