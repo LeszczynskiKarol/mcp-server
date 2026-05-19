@@ -31,6 +31,49 @@ try {
   );
 }
 
+// === hosts.json schema validation ===
+if (
+  Object.keys(HOSTS_CONFIG.hosts || {}).length > 0 ||
+  Object.keys(HOSTS_CONFIG.keys || {}).length > 0
+) {
+  const HostsSchema = z
+    .object({
+      hosts: z
+        .record(
+          z.object({
+            ip: z.string().min(1),
+            user: z.string().optional(),
+            key: z.string().min(1),
+            description: z.string().optional(),
+          }),
+        )
+        .optional()
+        .default({}),
+      keys: z.record(z.string().min(1)).optional().default({}),
+    })
+    .passthrough();
+  try {
+    HOSTS_CONFIG = HostsSchema.parse(HOSTS_CONFIG);
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      console.error("hosts.json schema invalid:");
+      for (const issue of e.issues) {
+        console.error(`  - ${issue.path.join(".")}: ${issue.message}`);
+      }
+      process.exit(1);
+    }
+    throw e;
+  }
+  // Warn about hosts that reference unknown keys
+  for (const [name, h] of Object.entries(HOSTS_CONFIG.hosts)) {
+    if (!HOSTS_CONFIG.keys[h.key]) {
+      console.warn(
+        `[hosts.json] host '${name}' references unknown key '${h.key}'`,
+      );
+    }
+  }
+}
+
 // === Configuration from env ===
 const OAUTH_USER = process.env.MCP_USER || "admin";
 const OAUTH_PASS = process.env.MCP_PASS;
@@ -71,8 +114,11 @@ const ENROLL_TTL_MS =
 const errors = [];
 if (!OAUTH_PASS) errors.push("MCP_PASS - OAuth login password");
 if (!BASE_URL) errors.push("MCP_BASE_URL - e.g. https://your-domain.com");
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  errors.push(`PORT must be an integer 1-65535, got '${process.env.PORT}'`);
+}
 if (errors.length) {
-  console.error("Missing required environment variables in .env:");
+  console.error("Missing or invalid environment variables in .env:");
   errors.forEach((e) => console.error("  - " + e));
   console.error("Copy .env.example to .env and fill it in.");
   process.exit(1);
@@ -93,24 +139,77 @@ console.log(
 );
 console.log(`Trust proxy: ${TRUST_PROXY}`);
 
+// === SSH known_hosts (host key pinning) ===
+// First connection to a host pins its fingerprint; subsequent connections
+// fail if the host key changes (MITM defence).
+const SSH_KNOWN_HOSTS =
+  process.env.SSH_KNOWN_HOSTS || path.join(process.cwd(), "known_hosts");
+try {
+  // Create empty file if it does not exist yet (touch)
+  fsSync.closeSync(fsSync.openSync(SSH_KNOWN_HOSTS, "a"));
+} catch (e) {
+  console.warn(
+    `[ssh] could not open known_hosts at ${SSH_KNOWN_HOSTS}: ${e.message}`,
+  );
+}
+const SSH_BASE_OPTS = [
+  "-o",
+  "StrictHostKeyChecking=accept-new",
+  "-o",
+  `UserKnownHostsFile=${SSH_KNOWN_HOSTS}`,
+  "-o",
+  "ConnectTimeout=10",
+  "-o",
+  "ServerAliveInterval=30",
+];
+
 // === OAuth state persistence ===
 const OAUTH_STATE_FILE =
   process.env.OAUTH_STATE_FILE || path.join(process.cwd(), "oauth-state.json");
 const CLIENT_TTL_MS =
   parseInt(process.env.CLIENT_TTL_SECONDS || "7776000", 10) * 1000; // 90 days
+const MAX_CLIENTS = parseInt(process.env.MCP_MAX_CLIENTS || "1000", 10);
+
+// Tokens are stored hashed (sha256). Raw tokens are issued to the client only
+// once; the server keeps only the hash, so leaking oauth-state.json does not
+// grant session access.
+function hashToken(token) {
+  return "sha256:" + crypto.createHash("sha256").update(token).digest("hex");
+}
 
 function loadOauthState() {
   try {
     const raw = fsSync.readFileSync(OAUTH_STATE_FILE, "utf8");
     const data = JSON.parse(raw);
+    // Auto-migrate legacy plaintext token keys to hashed keys on load
+    let migrated = 0;
+    const migrateMap = (obj) => {
+      const out = {};
+      for (const [k, v] of Object.entries(obj || {})) {
+        if (k.startsWith("sha256:")) {
+          out[k] = v;
+        } else {
+          out[hashToken(k)] = v;
+          migrated++;
+        }
+      }
+      return out;
+    };
+    const accessRaw = migrateMap(data.accessTokens);
+    const refreshRaw = migrateMap(data.refreshTokens);
+    if (migrated > 0) {
+      console.log(
+        `[oauth] migrated ${migrated} plaintext token(s) to hashed form`,
+      );
+    }
     console.log(
-      `[oauth] loaded state: ${Object.keys(data.clients || {}).length} clients, ${Object.keys(data.accessTokens || {}).length} tokens`,
+      `[oauth] loaded state: ${Object.keys(data.clients || {}).length} clients, ${Object.keys(accessRaw).length} tokens`,
     );
     return {
       clients: new Map(Object.entries(data.clients || {})),
       authCodes: new Map(Object.entries(data.authCodes || {})),
-      accessTokens: new Map(Object.entries(data.accessTokens || {})),
-      refreshTokens: new Map(Object.entries(data.refreshTokens || {})),
+      accessTokens: new Map(Object.entries(accessRaw)),
+      refreshTokens: new Map(Object.entries(refreshRaw)),
       dynamicAllowlist: new Map(Object.entries(data.dynamicAllowlist || {})),
     };
   } catch (e) {
@@ -130,23 +229,43 @@ const { clients, authCodes, accessTokens, refreshTokens, dynamicAllowlist } =
   loadOauthState();
 
 let saveTimer = null;
+let saveInFlight = false;
+let saveQueued = false;
+
+async function flushState() {
+  const data = {
+    clients: Object.fromEntries(clients),
+    authCodes: Object.fromEntries(authCodes),
+    accessTokens: Object.fromEntries(accessTokens),
+    refreshTokens: Object.fromEntries(refreshTokens),
+    dynamicAllowlist: Object.fromEntries(dynamicAllowlist),
+  };
+  const tmp = OAUTH_STATE_FILE + ".tmp";
+  try {
+    await fs.writeFile(tmp, JSON.stringify(data, null, 2));
+    await fs.rename(tmp, OAUTH_STATE_FILE);
+  } catch (e) {
+    console.error(`[oauth] state save failed: ${e.message}`);
+  }
+}
+
 function saveOauthState() {
+  if (saveInFlight) {
+    saveQueued = true;
+    return;
+  }
   if (saveTimer) return;
-  saveTimer = setTimeout(() => {
+  saveTimer = setTimeout(async () => {
     saveTimer = null;
-    const data = {
-      clients: Object.fromEntries(clients),
-      authCodes: Object.fromEntries(authCodes),
-      accessTokens: Object.fromEntries(accessTokens),
-      refreshTokens: Object.fromEntries(refreshTokens),
-      dynamicAllowlist: Object.fromEntries(dynamicAllowlist),
-    };
-    const tmp = OAUTH_STATE_FILE + ".tmp";
+    saveInFlight = true;
     try {
-      fsSync.writeFileSync(tmp, JSON.stringify(data, null, 2));
-      fsSync.renameSync(tmp, OAUTH_STATE_FILE);
-    } catch (e) {
-      console.error(`[oauth] state save failed: ${e.message}`);
+      await flushState();
+    } finally {
+      saveInFlight = false;
+      if (saveQueued) {
+        saveQueued = false;
+        saveOauthState();
+      }
     }
   }, 500).unref();
 }
@@ -209,29 +328,75 @@ function safeCompare(a, b) {
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
 
+// CSRF token: HMAC-signed, bound to client_id, 10 min TTL. Stateless — no
+// cookies, no session. CSRF_SECRET is regenerated at boot, so any form already
+// open during a restart will get a 400 on submit (acceptable trade-off).
+const CSRF_SECRET = crypto.randomBytes(32);
+const CSRF_TTL_MS = 10 * 60 * 1000;
+
+function makeCsrf(client_id) {
+  const ts = Date.now().toString();
+  const sig = crypto
+    .createHmac("sha256", CSRF_SECRET)
+    .update(`${client_id}|${ts}`)
+    .digest("base64url");
+  return `${ts}.${sig}`;
+}
+
+function verifyCsrf(token, client_id) {
+  if (!token || typeof token !== "string") return false;
+  const dot = token.indexOf(".");
+  if (dot <= 0) return false;
+  const ts = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  const tsNum = parseInt(ts, 10);
+  if (!Number.isFinite(tsNum)) return false;
+  const age = Date.now() - tsNum;
+  if (age < 0 || age > CSRF_TTL_MS) return false;
+  const expected = crypto
+    .createHmac("sha256", CSRF_SECRET)
+    .update(`${client_id}|${ts}`)
+    .digest("base64url");
+  if (sig.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
 const oauthLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 30,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "too_many_requests" },
+});
+
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "too_many_registrations" },
 });
 
 const server = new McpServer({ name: SERVER_NAME, version: "1.0.0" });
 
 server.tool(
   "aws_cli",
-  "Run an AWS CLI command using the locally configured AWS profile. Use for any AWS operation: describe-instances, s3 ls, logs filter-log-events, etc.",
+  "Run an AWS CLI command using the locally configured AWS profile. Pass arguments as an array of strings (no 'aws' prefix). Each flag and its value must be separate elements. Examples: ['ec2','describe-instances','--region','eu-central-1'], ['s3','ls'], ['logs','filter-log-events','--log-group-name','/aws/lambda/my-fn'].",
   {
-    command: z
-      .string()
+    args: z
+      .array(z.string())
+      .min(1)
       .describe(
-        "AWS CLI command without the 'aws' prefix, e.g. 'ec2 describe-instances --region eu-central-1'",
+        "AWS CLI arguments as an array of strings, e.g. ['ec2','describe-instances','--region','eu-central-1']",
       ),
   },
-  async ({ command }) => {
+  async ({ args }) => {
     try {
-      const { stdout, stderr } = await execAsync(`aws ${command}`, {
+      const { stdout, stderr } = await execFileAsync("aws", args, {
         maxBuffer: EXEC_BUFFER,
         timeout: EXEC_TIMEOUT_MS,
       });
@@ -267,18 +432,7 @@ server.tool(
       const keyPath = resolveKeyPath(key);
       const { stdout, stderr } = await execFileAsync(
         "ssh",
-        [
-          "-i",
-          keyPath,
-          "-o",
-          "StrictHostKeyChecking=no",
-          "-o",
-          "ConnectTimeout=10",
-          "-o",
-          "ServerAliveInterval=30",
-          `${user}@${host}`,
-          command,
-        ],
+        ["-i", keyPath, ...SSH_BASE_OPTS, `${user}@${host}`, command],
         { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
       );
       const parts = [];
@@ -524,22 +678,12 @@ function buildSshArgs(hostKey) {
       `Unknown host '${hostKey}'. Available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(hosts.json not loaded)"}`,
     );
   const user = h.user || "ubuntu";
-  return [
-    "-i",
-    resolveKeyPath(h.key),
-    "-o",
-    "StrictHostKeyChecking=no",
-    "-o",
-    "ConnectTimeout=10",
-    "-o",
-    "ServerAliveInterval=30",
-    `${user}@${h.ip}`,
-  ];
+  return ["-i", resolveKeyPath(h.key), ...SSH_BASE_OPTS, `${user}@${h.ip}`];
 }
 
 server.tool(
   "postgres_query",
-  "Run a SQL query on a PostgreSQL database over SSH on a remote host from hosts.json. Uses psql via 'sudo -u postgres', so no password is needed (passwordless sudo required on the remote). SELECT returns data; DML/DDL also work - be careful on production databases.",
+  "Run a SQL query on a PostgreSQL database over SSH on a remote host from hosts.json. Uses psql via 'sudo -u postgres', so no password is needed (passwordless sudo required on the remote). SELECT returns data; DML/DDL also work - be careful on production databases. format='json' wraps SELECT/WITH queries with json_agg and returns a real JSON array.",
   {
     host: z
       .string()
@@ -557,7 +701,9 @@ server.tool(
     format: z
       .enum(["table", "csv", "json"])
       .default("table")
-      .describe("psql output format"),
+      .describe(
+        "Output format. 'table' = psql aligned text; 'csv' = psql --csv; 'json' = real JSON array (SELECT/WITH only).",
+      ),
   },
   async ({ host, database, query, format }) => {
     try {
@@ -567,15 +713,27 @@ server.tool(
           `Invalid database name: must match [a-zA-Z0-9_]+, got '${database}'`,
         );
       }
+      let finalQuery = query;
+      let fmtFlag = "";
+      if (format === "csv") {
+        fmtFlag = "--csv";
+      } else if (format === "json") {
+        const trimmed = query.trim().replace(/;+\s*$/, "");
+        if (!/^\s*(select|with)\b/i.test(trimmed)) {
+          throw new Error(
+            "format='json' only works with SELECT or WITH queries",
+          );
+        }
+        finalQuery = `SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (${trimmed}) t;`;
+        fmtFlag = "-A -t";
+      }
       // pass SQL via base64 -> stdin to avoid any shell quoting nightmares
-      const sqlB64 = Buffer.from(query, "utf8").toString("base64");
-      const fmtFlag =
-        format === "csv" ? "--csv" : format === "json" ? "-A -t" : "";
+      const sqlB64 = Buffer.from(finalQuery, "utf8").toString("base64");
       const remoteCmd = `cd /tmp && echo ${sqlB64} | base64 -d | sudo -u postgres psql -d ${database} ${fmtFlag}`;
       const { stdout, stderr } = await execFileAsync(
         "ssh",
         [...sshArgs, remoteCmd],
-        { maxBuffer: EXEC_BUFFER },
+        { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
       );
       const parts = [];
       if (stdout) parts.push(stdout);
@@ -642,7 +800,7 @@ server.tool(
         const { stdout, stderr } = await execFileAsync(
           "ssh",
           [...sshArgs, rc],
-          { maxBuffer: EXEC_BUFFER },
+          { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
         );
         const partOut = [];
         if (stdout) partOut.push(stdout);
@@ -741,6 +899,11 @@ server.tool(
       let currentWords = 0;
       let startLine = 1;
 
+      // Sentence terminator followed by optional closing punctuation (straight
+      // and curly quotes, guillemets, right brackets) and end-of-line.
+      // Catches: . ! ? … ." ?» !) …" — common in Polish/dialog texts.
+      const SENTENCE_END = /[.!?\u2026][\s"'\u201D\u2019\u00BB\u203A)\]]*\s*$/;
+
       for (let i = 0; i < lines.length; i++) {
         const lineWords = lines[i].split(/\s+/).filter(Boolean).length;
         currentChunk.push(lines[i]);
@@ -751,7 +914,7 @@ server.tool(
         const onEmpty =
           currentWords >= words_per_chunk && lines[i].trim() === "";
         const onSentence =
-          currentWords >= words_per_chunk * 1.5 && /[.!?]\s*$/.test(lines[i]);
+          currentWords >= words_per_chunk * 1.5 && SENTENCE_END.test(lines[i]);
         const onHardCap = currentWords >= words_per_chunk * 2;
         if (onEmpty || onSentence || onHardCap) {
           chunks.push({
@@ -1018,7 +1181,7 @@ if (TRUST_PROXY !== false) {
 }
 app.use(express.json({ limit: "50mb" }));
 
-// Log wszystkich requestów do OAuth/MCP
+// Log all OAuth/MCP requests
 const SENSITIVE_KEYS = new Set([
   "password",
   "client_secret",
@@ -1058,6 +1221,7 @@ app.use((req, res, next) => {
 app.use("/oauth/token", oauthLimiter);
 app.use("/oauth/authorize", oauthLimiter);
 app.use("/oauth/revoke", oauthLimiter);
+app.use("/oauth/register", registerLimiter);
 
 // Anti-clickjacking on the login form: deny framing entirely.
 // frameguard only — full helmet defaults add headers that can break the form
@@ -1091,7 +1255,7 @@ const mcpHandler = async (req, res) => {
   }
   const auth = req.headers.authorization || "";
   const bearer = auth.replace(/^Bearer\s+/, "");
-  const tokenData = accessTokens.get(bearer);
+  const tokenData = bearer ? accessTokens.get(hashToken(bearer)) : null;
   if (!tokenData || tokenData.expires < Date.now()) {
     res.set(
       "WWW-Authenticate",
@@ -1111,9 +1275,9 @@ app.post("/mcp", mcpHandler);
 app.get("/mcp", mcpHandler);
 app.delete("/mcp", mcpHandler);
 
-// === OAuth 2.1 endpoints dla MCP ===
+// === OAuth 2.1 endpoints for MCP ===
 
-// Discovery - Claude.ai pyta tu o endpointy
+// Discovery - Claude.ai fetches endpoint URLs here
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   res.json({
     issuer: BASE_URL,
@@ -1129,7 +1293,7 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
   });
 });
 
-// Resource discovery - nowy standard MCP
+// Resource discovery - new MCP standard
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   res.json({
     resource: `${BASE_URL}/mcp`,
@@ -1137,8 +1301,14 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
   });
 });
 
-// Dynamic Client Registration - Claude rejestruje się tu automatycznie
+// Dynamic Client Registration - Claude registers itself here automatically
 app.post("/oauth/register", (req, res) => {
+  if (clients.size >= MAX_CLIENTS) {
+    console.warn(
+      `[oauth] register rejected: client registry full (${clients.size}/${MAX_CLIENTS})`,
+    );
+    return res.status(503).json({ error: "client_registry_full" });
+  }
   const client_id = crypto.randomBytes(16).toString("hex");
   const client_secret = crypto.randomBytes(32).toString("hex");
   clients.set(client_id, {
@@ -1160,7 +1330,7 @@ app.post("/oauth/register", (req, res) => {
   });
 });
 
-// Authorize - pokazuje login form, po zatwierdzeniu redirect z code
+// Authorize - shows login form; on submit redirects with an auth code
 app.get("/oauth/authorize", (req, res) => {
   const {
     client_id,
@@ -1190,6 +1360,7 @@ app.get("/oauth/authorize", (req, res) => {
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
+  const csrf = makeCsrf(client_id);
   res.send(`
     <html><body style="font-family:sans-serif;max-width:400px;margin:50px auto">
       <h2>Sign in to MCP</h2>
@@ -1199,6 +1370,7 @@ app.get("/oauth/authorize", (req, res) => {
         <input type="hidden" name="state" value="${esc(state)}">
         <input type="hidden" name="code_challenge" value="${esc(code_challenge)}">
         <input type="hidden" name="code_challenge_method" value="${esc(code_challenge_method)}">
+        <input type="hidden" name="csrf" value="${esc(csrf)}">
         <p><input name="username" placeholder="username" style="width:100%;padding:8px"></p>
         <p><input name="password" type="password" placeholder="password" style="width:100%;padding:8px"></p>
         <button type="submit" style="padding:10px 20px">Sign in</button>
@@ -1219,6 +1391,7 @@ app.post(
       state,
       code_challenge,
       code_challenge_method,
+      csrf,
     } = req.body;
     const client = clients.get(client_id);
     if (!client) return res.status(400).send("Unknown client");
@@ -1227,6 +1400,14 @@ app.post(
       !client.redirect_uris.includes(redirect_uri)
     ) {
       return res.status(400).send("Invalid redirect_uri");
+    }
+    if (!verifyCsrf(csrf, client_id)) {
+      console.log("  -> FAIL: CSRF token invalid or expired");
+      return res
+        .status(400)
+        .send(
+          "Invalid or expired form token. <a href='javascript:history.back()'>Back</a>",
+        );
     }
     if (
       !safeCompare(username, OAUTH_USER) ||
@@ -1258,7 +1439,7 @@ app.post(
   },
 );
 
-// Token - wymiana code na access_token
+// Token - exchange auth code for access_token
 app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
   const { grant_type, code, client_id, code_verifier } = req.body;
   const provided_client_secret = req.body.client_secret;
@@ -1286,7 +1467,7 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
     }
   }
 
-  // Obsługa refresh_token grant
+  // refresh_token grant
   if (grant_type === "refresh_token") {
     const { refresh_token: rt } = req.body;
     console.log("  REFRESH for token:", rt?.slice(0, 8));
@@ -1294,7 +1475,8 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
       console.log("  -> FAIL: missing refresh_token");
       return res.status(400).json({ error: "invalid_request" });
     }
-    const rtData = refreshTokens.get(rt);
+    const rtHash = hashToken(rt);
+    const rtData = refreshTokens.get(rtHash);
     if (!rtData || rtData.expires < Date.now()) {
       console.log(
         "  -> FAIL: invalid refresh_token (exists?",
@@ -1314,15 +1496,15 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
       );
       return res.status(400).json({ error: "invalid_grant" });
     }
-    // Rotacja: stary refresh_token invalidujemy
-    refreshTokens.delete(rt);
+    // Rotation: invalidate the old refresh_token
+    refreshTokens.delete(rtHash);
     const new_at = crypto.randomBytes(32).toString("hex");
     const new_rt = crypto.randomBytes(32).toString("hex");
-    accessTokens.set(new_at, {
+    accessTokens.set(hashToken(new_at), {
       client_id,
       expires: Date.now() + TOKEN_TTL_MS,
     });
-    refreshTokens.set(new_rt, {
+    refreshTokens.set(hashToken(new_rt), {
       client_id,
       expires: Date.now() + TOKEN_TTL_MS,
     });
@@ -1361,7 +1543,7 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
       "req=",
       client_id,
     );
-    authCodes.delete(code); // jednorazowy kod — invalidujemy
+    authCodes.delete(code); // one-time use — invalidate
     return res.status(400).json({ error: "invalid_grant" });
   }
 
@@ -1398,11 +1580,11 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
   authCodes.delete(code);
   const access_token = crypto.randomBytes(32).toString("hex");
   const refresh_token = crypto.randomBytes(32).toString("hex");
-  accessTokens.set(access_token, {
+  accessTokens.set(hashToken(access_token), {
     client_id,
     expires: Date.now() + TOKEN_TTL_MS, // 30 days by default
   });
-  refreshTokens.set(refresh_token, {
+  refreshTokens.set(hashToken(refresh_token), {
     client_id,
     expires: Date.now() + TOKEN_TTL_MS,
   });
@@ -1465,7 +1647,8 @@ app.post(
       return res.status(200).end();
     }
 
-    // Look up token. token_type_hint is optimization only — we check both maps.
+    // Look up token by hash. token_type_hint is optimization only — we check both maps.
+    const tokenHash = hashToken(token);
     const order =
       token_type_hint === "refresh_token"
         ? ["refresh", "access"]
@@ -1473,7 +1656,7 @@ app.post(
     let revoked = false;
     for (const kind of order) {
       const map = kind === "access" ? accessTokens : refreshTokens;
-      const data = map.get(token);
+      const data = map.get(tokenHash);
       if (!data) continue;
       // Only the owning client can revoke
       if (data.client_id !== client_id) {
@@ -1483,7 +1666,7 @@ app.post(
         // RFC says still respond 200 to avoid leaking info, but log it.
         break;
       }
-      map.delete(token);
+      map.delete(tokenHash);
       revoked = true;
       console.log(`  REVOKED ${kind}_token for client ${client_id}`);
       break;
@@ -1500,14 +1683,18 @@ const httpServer = app.listen(PORT, () =>
   console.log(`MCP listening on :${PORT}`),
 );
 
-function shutdown(signal) {
+async function shutdown(signal) {
   console.log(`\n[${signal}] graceful shutdown...`);
-  httpServer.close(() => {
+  httpServer.close(async () => {
     // Flush pending state save
     if (saveTimer) {
       clearTimeout(saveTimer);
       saveTimer = null;
-      saveOauthState();
+    }
+    try {
+      await flushState();
+    } catch (e) {
+      console.error(`[shutdown] state flush failed: ${e.message}`);
     }
     console.log("[shutdown] done");
     process.exit(0);
