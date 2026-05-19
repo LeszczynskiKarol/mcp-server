@@ -332,6 +332,50 @@ server.tool(
 );
 
 server.tool(
+  "write_file",
+  "Write text content to a file on the local machine. Creates parent directories if needed. Overwrites existing files. Use this for creating or replacing any text file (source code, markdown, JSON, config files, etc.) - no shell quoting, no encoding issues, full Unicode support. For appending to a file, use mode='append'.",
+  {
+    path: z
+      .string()
+      .describe(
+        "absolute path to the file, e.g. 'D:\\\\projects\\\\myapp\\\\src\\\\index.js' or '/home/user/notes.md'",
+      ),
+    content: z.string().describe("full text content to write"),
+    mode: z
+      .enum(["overwrite", "append"])
+      .default("overwrite")
+      .describe(
+        "'overwrite' replaces the file (default), 'append' adds to the end",
+      ),
+  },
+  async ({ path: filePath, content, mode }) => {
+    try {
+      const dir = path.dirname(filePath);
+      await fs.mkdir(dir, { recursive: true });
+      if (mode === "append") {
+        await fs.appendFile(filePath, content, "utf8");
+      } else {
+        await fs.writeFile(filePath, content, "utf8");
+      }
+      const stat = await fs.stat(filePath);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `OK ${mode === "append" ? "appended to" : "wrote"} ${filePath} (${stat.size} bytes)`,
+          },
+        ],
+      };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `ERROR: ${e.message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
   "github_api",
   "Make a request to the GitHub REST API using the configured Personal Access Token. Use endpoint paths like '/repos/{owner}/{repo}/...' or '/user/repos'. Default owner: '" +
     GITHUB_OWNER +

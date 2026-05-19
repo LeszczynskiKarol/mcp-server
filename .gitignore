@@ -6,9 +6,40 @@ node_modules/
 .env.local
 .env.*.local
 hosts.json
-
-mcp-task.generated.xml
-start-mcp-hidden.vbs
-mcp-task.xml
-logs/
 oauth-state.json
+
+# Task Scheduler / Windows autostart (generated, machine-specific)
+mcp-task.generated.xml
+mcp-task.xml
+start-mcp-hidden.vbs
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Backups and temporary files
+*.bak
+*.bak.*
+*.tmp
+.tmp_*
+
+# PM2 (legacy — not used since switch to Task Scheduler)
+dump.pm2
+.pm2/
+ecosystem.config.js
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+dist/
+build/
