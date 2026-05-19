@@ -13,6 +13,14 @@ Follow these rules to avoid wasting time on common failure modes.
 
 ## File editing rules (CRITICAL)
 
+### Workflow rules — do not waste roundtrips
+
+- Read the file ONCE. Do not re-read it after every edit "to verify". Trust the write.
+- Do NOT make backup copies (`*.bak`, `*.original`). The user has git.
+- Do NOT create intermediate files in the sandbox just to mirror the Windows file.
+- Do NOT call `find`, `dir`, `ls`, or "what's available" probes when you already know the path.
+- After `write_file`, run `node --check` if it's JS. That's the verification. Done.
+
 When the user is on Windows (D:\mcp-server\ or anywhere else) and asks to edit or create a file:
 
 ### Always prefer `write_file` over shell-based approaches
@@ -28,8 +36,12 @@ Example: `write_file(path: "D:\\projects\\app\\index.js", content: "...", mode: 
 
 ### Small in-place edits (< 20 lines, surgical find-and-replace)
 
-Use `local_exec` with PowerShell `-replace` or read-modify-write through `write_file`. Either works.
+For tiny surgical edits to an existing file: `local_exec` with PowerShell `-replace`.
 Do NOT pipe through cmd.exe with non-ASCII content — it will mangle UTF-8.
+
+### Editing larger sections of an existing file
+
+Read the current file ONCE (e.g. `Get-Content` via local_exec, or check the previous tool result if you already have it), modify in memory, and write the new version with `write_file` in a SINGLE call. Do NOT make a backup copy first, do NOT save the original to disk, do NOT create `server.original.js` or `server.js.bak` — those steps waste tokens and roundtrips. The user has git for that.
 
 ### What NEVER to do
 
