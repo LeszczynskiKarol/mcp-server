@@ -304,6 +304,23 @@ The first request from a new IP will trigger an OAuth re-login, which adds your 
 
 ---
 
+## Recommended Claude.ai preferences
+
+Even with the right tools installed, Claude will sometimes waste tokens on common failure modes: re-reading files after writing them, copying files into the sandbox "to edit them", lying that a file is on disk when only an artifact was created.
+
+[`CLAUDE_PREFERENCES.md`](CLAUDE_PREFERENCES.md) is a curated set of user preferences that closes those holes. Paste them into **Settings -> Profile -> Personal preferences** in [Claude.ai](https://claude.ai/settings/profile). They're battle-tested against the exact failure modes that prompted writing some of the tools in this server (especially `write_file`).
+
+Covers, among other things:
+
+- File-tool hierarchy: always `write_file` for new files, PowerShell for surgical edits, never base64-chunks through cmd.exe
+- "Trust the write" -- don't re-read a file just to confirm it saved
+- Sandbox isolation -- the bash sandbox has no access to your local disk; don't bridge it via public file hosts (uguu.se, transfer.sh, etc.)
+- Artifacts vs. MCP file writes -- "Created a file" tiles in the chat UI are NOT saved to your disk
+- Raw content rule -- `write_file` content must be raw, not JSON-escaped
+- Anti-loop limits -- stop after 3 failures on the same problem
+- Non-ASCII character handling on Windows (`cmd.exe` code page gotcha)
+
+---
 ## Running on Windows
 
 The recommended autostart on Windows uses **Task Scheduler** + a small `.bat` with a restart loop. PM2 used to be the recommendation but is currently incompatible with Node 25's named-pipe handling (`EPERM \\.\pipe\rpc.sock`), so the project has switched to plain Task Scheduler.
@@ -448,6 +465,29 @@ For a full list of what the server enforces, see [SECURITY.md](SECURITY.md). The
 - **Rate limit** on `/oauth/*`: 30 requests / 15 minutes / IP
 - **Prototype pollution prevention** in `book_note` (`__proto__`, `constructor`, `prototype` keys rejected)
 - **Token values redacted in logs** — only `client_id` and the first 8 chars of any token are written
+
+## For AI assistants (Claude, Cursor, Cline, Aider, etc.)
+
+This repo includes `CLAUDE.md` with critical instructions for any AI assistant
+working on this codebase. **Read it first.** It documents:
+
+- The single correct way to edit files on the Windows host (`write_file` tool)
+- Anti-patterns that have wasted real tokens (sandbox-as-bridge, base64 chunks,
+  uploading files to public hosts to transfer them back to the owner's disk)
+- Anti-loop rules: 3 failures → stop and propose alternatives
+- Server restart workflow that breaks MCP sessions
+
+If you're a human deploying this MCP server for your own Claude.ai account:
+
+1. Copy the rules from `CLAUDE.md` into Settings → Profile → Personal preferences
+   in Claude.ai. That's the only mechanism in the web UI that loads instructions
+   at session start.
+2. (Optional) Copy `CLAUDE.md` into every repo you'll edit via this server. AI
+   tools running outside claude.ai (Claude Code, Cursor, Cline) will read it
+   automatically.
+3. Future Anthropic Agent Skills support in claude.ai web may eventually load
+   `~/.claude/skills/*.md` automatically. Until then, preferences + per-repo
+   CLAUDE.md is the working pattern.
 
 ### Recommended deployment posture
 
