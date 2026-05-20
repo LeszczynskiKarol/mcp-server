@@ -15,6 +15,13 @@ import path from "path";
 import { config } from "dotenv";
 config();
 
+process.on("uncaughtException", (e) => {
+  console.error("[uncaughtException]", e);
+});
+process.on("unhandledRejection", (e) => {
+  console.error("[unhandledRejection]", e);
+});
+
 // === Load hosts.json ===
 const HOSTS_CONFIG_PATH =
   process.env.HOSTS_CONFIG || path.join(process.cwd(), "hosts.json");
@@ -381,716 +388,779 @@ const registerLimiter = rateLimit({
   message: { error: "too_many_registrations" },
 });
 
-const server = new McpServer({ name: SERVER_NAME, version: "1.0.0" });
+function createMcpServer() {
+  const server = new McpServer({ name: SERVER_NAME, version: "1.0.0" });
 
-server.tool(
-  "aws_cli",
-  "Run an AWS CLI command using the locally configured AWS profile. Pass arguments as an array of strings (no 'aws' prefix). Each flag and its value must be separate elements. Examples: ['ec2','describe-instances','--region','eu-central-1'], ['s3','ls'], ['logs','filter-log-events','--log-group-name','/aws/lambda/my-fn'].",
-  {
-    args: z
-      .array(z.string())
-      .min(1)
-      .describe(
-        "AWS CLI arguments as an array of strings, e.g. ['ec2','describe-instances','--region','eu-central-1']",
-      ),
-  },
-  async ({ args }) => {
-    try {
-      const { stdout, stderr } = await execFileAsync("aws", args, {
-        maxBuffer: EXEC_BUFFER,
-        timeout: EXEC_TIMEOUT_MS,
-      });
-      return {
-        content: [{ type: "text", text: stdout || stderr || "(no output)" }],
-      };
-    } catch (e) {
-      return {
-        content: [
-          { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
-
-server.tool(
-  "ssh_exec",
-  "Run a shell command on a remote host over SSH using a key defined in hosts.json (the 'keys' section). Host is any IP or DNS, user defaults to 'ubuntu'.",
-  {
-    key: z
-      .string()
-      .describe("key name from hosts.json (e.g. 'main', 'production-key')"),
-    user: z.string().default("ubuntu").describe("SSH user (default: ubuntu)"),
-    host: z
-      .string()
-      .describe("IP or DNS, e.g. '1.2.3.4' or 'server.example.com'"),
-    command: z.string().describe("shell command to run on the remote host"),
-  },
-  async ({ key, user, host, command }) => {
-    try {
-      const keyPath = resolveKeyPath(key);
-      const { stdout, stderr } = await execFileAsync(
-        "ssh",
-        ["-i", keyPath, ...SSH_BASE_OPTS, `${user}@${host}`, command],
-        { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
-      );
-      const parts = [];
-      if (stdout) parts.push(stdout);
-      if (stderr) parts.push(`--- stderr ---\n${stderr}`);
-      return {
-        content: [{ type: "text", text: parts.join("\n") || "(no output)" }],
-      };
-    } catch (e) {
-      return {
-        content: [
-          { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
-
-server.tool(
-  "local_exec",
-  "Run a shell command on the local machine where this MCP server is running. On Windows the command goes to cmd.exe; on Linux/Mac to /bin/sh. Use for git, npm, file edits, pm2 control, etc.",
-  {
-    command: z
-      .string()
-      .describe(
-        "shell command, e.g. 'git status' or 'npm install' or 'pm2 list'",
-      ),
-    cwd: z.string().optional().describe("working directory (optional)"),
-  },
-  async ({ command, cwd }) => {
-    try {
-      const { stdout, stderr } = await execAsync(command, {
-        maxBuffer: EXEC_BUFFER,
-        cwd: cwd || undefined,
-        shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
-        timeout: EXEC_TIMEOUT_MS,
-      });
-      return {
-        content: [{ type: "text", text: stdout || stderr || "(no output)" }],
-      };
-    } catch (e) {
-      return {
-        content: [
-          { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
-
-server.tool(
-  "write_file",
-  "Write text content to a file on the local machine. Creates parent directories if needed. Overwrites existing files. Use this for creating or replacing any text file (source code, markdown, JSON, config files, etc.) - no shell quoting, no encoding issues, full Unicode support. For appending to a file, use mode='append'.",
-  {
-    path: z
-      .string()
-      .describe(
-        "absolute path to the file, e.g. 'D:\\\\projects\\\\myapp\\\\src\\\\index.js' or '/home/user/notes.md'",
-      ),
-    content: z.string().describe("full text content to write"),
-    mode: z
-      .enum(["overwrite", "append"])
-      .default("overwrite")
-      .describe(
-        "'overwrite' replaces the file (default), 'append' adds to the end",
-      ),
-  },
-  async ({ path: filePath, content, mode }) => {
-    try {
-      const dir = path.dirname(filePath);
-      await fs.mkdir(dir, { recursive: true });
-      if (mode === "append") {
-        await fs.appendFile(filePath, content, "utf8");
-      } else {
-        await fs.writeFile(filePath, content, "utf8");
-      }
-      const stat = await fs.stat(filePath);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `OK ${mode === "append" ? "appended to" : "wrote"} ${filePath} (${stat.size} bytes)`,
-          },
-        ],
-      };
-    } catch (e) {
-      return {
-        content: [{ type: "text", text: `ERROR: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
-);
-
-server.tool(
-  "github_api",
-  "Make a request to the GitHub REST API using the configured Personal Access Token. Use endpoint paths like '/repos/{owner}/{repo}/...' or '/user/repos'. Default owner: '" +
-    GITHUB_OWNER +
-    "'. Shortcut: if the endpoint starts with '/repos/NAME' (without owner/), the default owner is auto-prepended. Methods: GET (default), POST, PATCH, PUT, DELETE.",
-  {
-    endpoint: z
-      .string()
-      .describe(
-        "API path, e.g. '/repos/owner/repo/issues' or '/user/repos'. Do not include 'https://api.github.com'.",
-      ),
-    method: z
-      .enum(["GET", "POST", "PATCH", "PUT", "DELETE"])
-      .default("GET")
-      .describe("HTTP method"),
-    body: z
-      .record(z.any())
-      .optional()
-      .describe("body as JSON object (for POST/PATCH/PUT)"),
-    query: z
-      .record(z.string())
-      .optional()
-      .describe(
-        "query params as an object, e.g. {state:'open', per_page:'30'}",
-      ),
-  },
-  async ({ endpoint, method, body, query }) => {
-    if (!GITHUB_TOKEN)
-      return {
-        content: [{ type: "text", text: "GITHUB_TOKEN not set in .env" }],
-        isError: true,
-      };
-
-    // auto-prefix owner if shortcut form "/repos/repo-name[/sub-resource...]"
-    // Detection: if the second segment after /repos/ is a known GitHub sub-resource,
-    // then the first segment is a repo name (not an owner) and we prepend GITHUB_OWNER.
-    let ep = endpoint.startsWith("/") ? endpoint : "/" + endpoint;
-    const KNOWN_SUBRESOURCES = new Set([
-      "issues",
-      "pulls",
-      "commits",
-      "contents",
-      "branches",
-      "tags",
-      "releases",
-      "actions",
-      "workflows",
-      "labels",
-      "milestones",
-      "comments",
-      "events",
-      "collaborators",
-      "deployments",
-      "hooks",
-      "keys",
-      "languages",
-      "stargazers",
-      "subscribers",
-      "topics",
-      "readme",
-      "license",
-      "git",
-      "compare",
-      "statuses",
-      "check-runs",
-      "check-suites",
-      "code-scanning",
-      "secret-scanning",
-      "dependabot",
-      "pages",
-      "vulnerability-alerts",
-      "traffic",
-      "forks",
-      "merges",
-      "import",
-    ]);
-    if (GITHUB_OWNER) {
-      const parts = ep.split("/").filter(Boolean); // [repos, X, Y, ...]
-      if (
-        parts[0] === "repos" &&
-        parts[1] &&
-        (!parts[2] || KNOWN_SUBRESOURCES.has(parts[2]))
-      ) {
-        ep = "/" + ["repos", GITHUB_OWNER, ...parts.slice(1)].join("/");
-      }
-    }
-
-    const url = new URL("https://api.github.com" + ep);
-    if (query)
-      for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
-
-    try {
-      const resp = await fetch(url.toString(), {
-        method,
-        headers: {
-          Authorization: `Bearer ${GITHUB_TOKEN}`,
-          Accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-          "User-Agent": SERVER_NAME,
-          ...(body ? { "Content-Type": "application/json" } : {}),
-        },
-        ...(body ? { body: JSON.stringify(body) } : {}),
-      });
-      const text = await resp.text();
-      let parsed;
+  server.tool(
+    "aws_cli",
+    "Run an AWS CLI command using the locally configured AWS profile. Pass arguments as an array of strings (no 'aws' prefix). Each flag and its value must be separate elements. Examples: ['ec2','describe-instances','--region','eu-central-1'], ['s3','ls'], ['logs','filter-log-events','--log-group-name','/aws/lambda/my-fn'].",
+    {
+      args: z
+        .array(z.string())
+        .min(1)
+        .describe(
+          "AWS CLI arguments as an array of strings, e.g. ['ec2','describe-instances','--region','eu-central-1']",
+        ),
+    },
+    async ({ args }) => {
       try {
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = text;
+        const { stdout, stderr } = await execFileAsync("aws", args, {
+          maxBuffer: EXEC_BUFFER,
+          timeout: EXEC_TIMEOUT_MS,
+        });
+        return {
+          content: [{ type: "text", text: stdout || stderr || "(no output)" }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+          ],
+          isError: true,
+        };
       }
-      const out =
-        typeof parsed === "string" ? parsed : JSON.stringify(parsed, null, 2);
-      return {
-        content: [{ type: "text", text: `HTTP ${resp.status}\n\n${out}` }],
-        isError: !resp.ok,
-      };
-    } catch (e) {
-      return {
-        content: [{ type: "text", text: `ERROR: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
-);
+    },
+  );
 
-function resolveKeyPath(keyName) {
-  const p = (HOSTS_CONFIG.keys || {})[keyName];
-  if (!p)
-    throw new Error(
-      `Unknown key '${keyName}'. Available: ${Object.keys(HOSTS_CONFIG.keys || {}).join(", ") || "(hosts.json not loaded)"}`,
-    );
-  // Cross-platform path normalization: tilde, forward slashes
-  let resolved = p;
-  if (resolved.startsWith("~/") || resolved.startsWith("~\\")) {
-    resolved = path.join(
-      process.env.HOME || process.env.USERPROFILE || "",
-      resolved.slice(2),
-    );
-  }
-  return path.normalize(resolved);
-}
-
-function buildSshArgs(hostKey) {
-  const h = (HOSTS_CONFIG.hosts || {})[hostKey];
-  if (!h)
-    throw new Error(
-      `Unknown host '${hostKey}'. Available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(hosts.json not loaded)"}`,
-    );
-  const user = h.user || "ubuntu";
-  return ["-i", resolveKeyPath(h.key), ...SSH_BASE_OPTS, `${user}@${h.ip}`];
-}
-
-server.tool(
-  "postgres_query",
-  "Run a SQL query on a PostgreSQL database over SSH on a remote host from hosts.json. Uses psql via 'sudo -u postgres', so no password is needed (passwordless sudo required on the remote). SELECT returns data; DML/DDL also work - be careful on production databases. format='json' wraps SELECT/WITH queries with json_agg and returns a real JSON array.",
-  {
-    host: z
-      .string()
-      .describe(
-        `host from hosts.json - available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none - hosts.json not loaded)"}`,
-      ),
-    database: z
-      .string()
-      .describe("database name, e.g. 'mydb' or 'app_production'"),
-    query: z
-      .string()
-      .describe(
-        "SQL query, e.g. \"SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '1 day'\"",
-      ),
-    format: z
-      .enum(["table", "csv", "json"])
-      .default("table")
-      .describe(
-        "Output format. 'table' = psql aligned text; 'csv' = psql --csv; 'json' = real JSON array (SELECT/WITH only).",
-      ),
-  },
-  async ({ host, database, query, format }) => {
-    try {
-      const sshArgs = buildSshArgs(host);
-      if (!/^[a-zA-Z0-9_]+$/.test(database)) {
-        throw new Error(
-          `Invalid database name: must match [a-zA-Z0-9_]+, got '${database}'`,
-        );
-      }
-      let finalQuery = query;
-      let fmtFlag = "";
-      if (format === "csv") {
-        fmtFlag = "--csv";
-      } else if (format === "json") {
-        const trimmed = query.trim().replace(/;+\s*$/, "");
-        if (!/^\s*(select|with)\b/i.test(trimmed)) {
-          throw new Error(
-            "format='json' only works with SELECT or WITH queries",
-          );
-        }
-        finalQuery = `SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (${trimmed}) t;`;
-        fmtFlag = "-A -t";
-      }
-      // pass SQL via base64 -> stdin to avoid any shell quoting nightmares
-      const sqlB64 = Buffer.from(finalQuery, "utf8").toString("base64");
-      const remoteCmd = `cd /tmp && echo ${sqlB64} | base64 -d | sudo -u postgres psql -d ${database} ${fmtFlag}`;
-      const { stdout, stderr } = await execFileAsync(
-        "ssh",
-        [...sshArgs, remoteCmd],
-        { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
-      );
-      const parts = [];
-      if (stdout) parts.push(stdout);
-      if (stderr) parts.push(`--- stderr ---\n${stderr}`);
-      return {
-        content: [{ type: "text", text: parts.join("\n") || "(no output)" }],
-      };
-    } catch (e) {
-      return {
-        content: [
-          { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
-
-server.tool(
-  "pm2_status",
-  "Show PM2 status (process list and optionally recent logs) on a remote host. Quick diagnostics: 'pm2_status host=production' or with logs 'pm2_status host=production app=myapp lines=100'. Requires PM2 installed on the remote (under NVM is fine - nvm.sh is auto-sourced).",
-  {
-    host: z
-      .string()
-      .describe(
-        `host from hosts.json - available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none - hosts.json not loaded)"}`,
-      ),
-    app: z
-      .string()
-      .optional()
-      .describe(
-        "specific PM2 app name (if you want logs for one app only). Omit for process list only.",
-      ),
-    lines: z
-      .number()
-      .int()
-      .min(0)
-      .max(500)
-      .default(0)
-      .describe("how many log lines to show. 0 = no logs (list only)"),
-  },
-  async ({ host, app, lines }) => {
-    try {
-      const sshArgs = buildSshArgs(host);
-      const buildRemote = (cmd) => {
-        const script = [
-          'export NVM_DIR="$HOME/.nvm"',
-          '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"',
-          'export PATH="$PATH:/usr/local/bin:/usr/bin"',
-          cmd,
-        ].join("\n");
-        const b64 = Buffer.from(script).toString("base64");
-        return `echo ${b64} | base64 -d | bash`;
-      };
-      const remoteCmds = [buildRemote("pm2 list")];
-      if (lines > 0) {
-        const target = app ? app : "all";
-        remoteCmds.push(
-          buildRemote(`pm2 logs ${target} --lines ${lines} --nostream`),
-        );
-      }
-      const outputs = [];
-      for (const rc of remoteCmds) {
+  server.tool(
+    "ssh_exec",
+    "Run a shell command on a remote host over SSH using a key defined in hosts.json (the 'keys' section). Host is any IP or DNS, user defaults to 'ubuntu'.",
+    {
+      key: z
+        .string()
+        .describe("key name from hosts.json (e.g. 'main', 'production-key')"),
+      user: z.string().default("ubuntu").describe("SSH user (default: ubuntu)"),
+      host: z
+        .string()
+        .describe("IP or DNS, e.g. '1.2.3.4' or 'server.example.com'"),
+      command: z.string().describe("shell command to run on the remote host"),
+    },
+    async ({ key, user, host, command }) => {
+      try {
+        const keyPath = resolveKeyPath(key);
         const { stdout, stderr } = await execFileAsync(
           "ssh",
-          [...sshArgs, rc],
+          ["-i", keyPath, ...SSH_BASE_OPTS, `${user}@${host}`, command],
           { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
         );
-        const partOut = [];
-        if (stdout) partOut.push(stdout);
-        if (stderr) partOut.push(`--- stderr ---\n${stderr}`);
-        outputs.push(partOut.join("\n") || "(no output)");
+        const parts = [];
+        if (stdout) parts.push(stdout);
+        if (stderr) parts.push(`--- stderr ---\n${stderr}`);
+        return {
+          content: [{ type: "text", text: parts.join("\n") || "(no output)" }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+          ],
+          isError: true,
+        };
       }
-      return { content: [{ type: "text", text: outputs.join("\n\n---\n\n") }] };
-    } catch (e) {
-      return {
-        content: [
-          { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
+    },
+  );
 
-server.tool(
-  "book_chunk",
-  "Read one chunk of a large text file (e.g. a book) that was pre-split into ~3000-word chunks by book_split. Use iteratively to read through a whole document that does not fit in the context window. Returns the chunk text plus metadata (chunk_index, total_chunks, line_range).",
-  {
-    book_dir: z
-      .string()
-      .describe("directory containing chunks, e.g. '/path/to/book/chunks'"),
-    chunk_index: z
-      .number()
-      .int()
-      .min(0)
-      .describe("which chunk to read (0-indexed)"),
-  },
-  async ({ book_dir, chunk_index }) => {
-    try {
-      const meta = JSON.parse(
-        await fs.readFile(path.join(book_dir, "_meta.json"), "utf8"),
-      );
-      if (chunk_index >= meta.total_chunks) {
+  server.tool(
+    "local_exec",
+    "Run a shell command on the local machine where this MCP server is running. On Windows the command goes to cmd.exe; on Linux/Mac to /bin/sh. Use for git, npm, file edits, pm2 control, etc.",
+    {
+      command: z
+        .string()
+        .describe(
+          "shell command, e.g. 'git status' or 'npm install' or 'pm2 list'",
+        ),
+      cwd: z.string().optional().describe("working directory (optional)"),
+    },
+    async ({ command, cwd }) => {
+      try {
+        const { stdout, stderr } = await execAsync(command, {
+          maxBuffer: EXEC_BUFFER,
+          cwd: cwd || undefined,
+          shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
+          timeout: EXEC_TIMEOUT_MS,
+        });
+        return {
+          content: [{ type: "text", text: stdout || stderr || "(no output)" }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "write_file",
+    "Write text content to a file on the local machine. Creates parent directories if needed. Overwrites existing files. Use this for creating or replacing any text file (source code, markdown, JSON, config files, etc.) - no shell quoting, no encoding issues, full Unicode support. For appending to a file, use mode='append'.",
+    {
+      path: z
+        .string()
+        .describe(
+          "absolute path to the file, e.g. 'D:\\\\projects\\\\myapp\\\\src\\\\index.js' or '/home/user/notes.md'",
+        ),
+      content: z.string().describe("full text content to write"),
+      mode: z
+        .enum(["overwrite", "append"])
+        .default("overwrite")
+        .describe(
+          "'overwrite' replaces the file (default), 'append' adds to the end",
+        ),
+    },
+    async ({ path: filePath, content, mode }) => {
+      // Detect JSON-escape disasters: TAB/CR/LF/NUL in path = client sent
+      // `\t`, `\n`, `\r`, `\0` as single backslash instead of `\\t` etc.
+      // mkdir would create or fail silently with garbage names. Reject early.
+      if (/[\t\r\n\0\v\f]/.test(filePath)) {
+        const codes = [...filePath]
+          .map((c) => c.charCodeAt(0).toString(16).padStart(2, "0"))
+          .join(" ");
         return {
           content: [
             {
               type: "text",
-              text: `End of document. Total chunks: ${meta.total_chunks}`,
+              text: `ERROR: path contains control character (TAB/CR/LF/NUL). Likely a JSON-escape bug — you probably wrote "D:\\temp" instead of "D:\\\\temp" or "D:/temp". Path bytes: ${codes}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      // Defensive size limit: large overwrite content is at high risk of
+      // being truncated mid-stream by client output limits or overload retries.
+      // For mega-files, the caller MUST chunk via mode=append. This prevents
+      // silent corruption where only part of intended content lands on disk.
+      const sizeBytes = Buffer.byteLength(content, 'utf8');
+      const HARD_LIMIT = 50 * 1024;
+      const WARN_LIMIT = 30 * 1024;
+      if (sizeBytes > HARD_LIMIT && mode === 'overwrite') {
+        return {
+          content: [{
+            type: 'text',
+            text:
+              'ERROR: content size ' + (sizeBytes / 1024).toFixed(1) + ' KB ' +
+              'exceeds single-write hard limit (' + (HARD_LIMIT / 1024) + ' KB). ' +
+              'This write would risk being truncated by output limits or ' +
+              'overload retries.\\n\\n' +
+              'REQUIRED FIX: chunk the content.\\n' +
+              '1. First call: write_file mode=\"overwrite\" with first ~20-30 KB ' +
+              '(opening structure + first section)\\n' +
+              '2. Subsequent calls: write_file mode=\"append\", each ~20-30 KB chunk\\n' +
+              '3. Final call: write_file mode=\"append\" with closing structure\\n\\n' +
+              'If you got this error after a previous chunk succeeded, your retry ' +
+              'was using overwrite mode - switch to append.'
+          }],
+          isError: true,
+        };
+      }
+      if (sizeBytes > WARN_LIMIT) {
+        console.warn(`[write_file] large content ${(sizeBytes / 1024).toFixed(1)} KB to ${filePath} - consider chunking`);
+      }
+      try {
+        const dir = path.dirname(filePath);
+        await fs.mkdir(dir, { recursive: true });
+        if (mode === "append") {
+          await fs.appendFile(filePath, content, "utf8");
+        } else {
+          await fs.writeFile(filePath, content, "utf8");
+        }
+        const stat = await fs.stat(filePath);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `OK ${mode === "append" ? "appended to" : "wrote"} ${filePath} (${stat.size} bytes)`,
             },
           ],
         };
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `ERROR: ${e.message}` }],
+          isError: true,
+        };
       }
-      const chunkPath = path.join(
-        book_dir,
-        `chunk_${String(chunk_index).padStart(4, "0")}.txt`,
-      );
-      const text = await fs.readFile(chunkPath, "utf8");
-      return {
-        content: [
-          {
-            type: "text",
-            text: `[CHUNK ${chunk_index + 1}/${meta.total_chunks}, lines ${meta.chunks[chunk_index].start_line}-${meta.chunks[chunk_index].end_line}]\n\n${text}`,
+    },
+  );
+
+  server.tool(
+    "github_api",
+    "Make a request to the GitHub REST API using the configured Personal Access Token. Use endpoint paths like '/repos/{owner}/{repo}/...' or '/user/repos'. Default owner: '" +
+      GITHUB_OWNER +
+      "'. Shortcut: if the endpoint starts with '/repos/NAME' (without owner/), the default owner is auto-prepended. Methods: GET (default), POST, PATCH, PUT, DELETE.",
+    {
+      endpoint: z
+        .string()
+        .describe(
+          "API path, e.g. '/repos/owner/repo/issues' or '/user/repos'. Do not include 'https://api.github.com'.",
+        ),
+      method: z
+        .enum(["GET", "POST", "PATCH", "PUT", "DELETE"])
+        .default("GET")
+        .describe("HTTP method"),
+      body: z
+        .record(z.any())
+        .optional()
+        .describe("body as JSON object (for POST/PATCH/PUT)"),
+      query: z
+        .record(z.string())
+        .optional()
+        .describe(
+          "query params as an object, e.g. {state:'open', per_page:'30'}",
+        ),
+    },
+    async ({ endpoint, method, body, query }) => {
+      if (!GITHUB_TOKEN)
+        return {
+          content: [{ type: "text", text: "GITHUB_TOKEN not set in .env" }],
+          isError: true,
+        };
+
+      // auto-prefix owner if shortcut form "/repos/repo-name[/sub-resource...]"
+      // Detection: if the second segment after /repos/ is a known GitHub sub-resource,
+      // then the first segment is a repo name (not an owner) and we prepend GITHUB_OWNER.
+      let ep = endpoint.startsWith("/") ? endpoint : "/" + endpoint;
+      const KNOWN_SUBRESOURCES = new Set([
+        "issues",
+        "pulls",
+        "commits",
+        "contents",
+        "branches",
+        "tags",
+        "releases",
+        "actions",
+        "workflows",
+        "labels",
+        "milestones",
+        "comments",
+        "events",
+        "collaborators",
+        "deployments",
+        "hooks",
+        "keys",
+        "languages",
+        "stargazers",
+        "subscribers",
+        "topics",
+        "readme",
+        "license",
+        "git",
+        "compare",
+        "statuses",
+        "check-runs",
+        "check-suites",
+        "code-scanning",
+        "secret-scanning",
+        "dependabot",
+        "pages",
+        "vulnerability-alerts",
+        "traffic",
+        "forks",
+        "merges",
+        "import",
+      ]);
+      if (GITHUB_OWNER) {
+        const parts = ep.split("/").filter(Boolean); // [repos, X, Y, ...]
+        if (
+          parts[0] === "repos" &&
+          parts[1] &&
+          (!parts[2] || KNOWN_SUBRESOURCES.has(parts[2]))
+        ) {
+          ep = "/" + ["repos", GITHUB_OWNER, ...parts.slice(1)].join("/");
+        }
+      }
+
+      const url = new URL("https://api.github.com" + ep);
+      if (query)
+        for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
+
+      try {
+        const resp = await fetch(url.toString(), {
+          method,
+          headers: {
+            Authorization: `Bearer ${GITHUB_TOKEN}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": SERVER_NAME,
+            ...(body ? { "Content-Type": "application/json" } : {}),
           },
-        ],
-      };
-    } catch (e) {
-      return {
-        content: [{ type: "text", text: `ERROR: ${e.message}` }],
-        isError: true,
-      };
+          ...(body ? { body: JSON.stringify(body) } : {}),
+        });
+        const text = await resp.text();
+        let parsed;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = text;
+        }
+        const out =
+          typeof parsed === "string" ? parsed : JSON.stringify(parsed, null, 2);
+        return {
+          content: [{ type: "text", text: `HTTP ${resp.status}\n\n${out}` }],
+          isError: !resp.ok,
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `ERROR: ${e.message}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  function resolveKeyPath(keyName) {
+    const p = (HOSTS_CONFIG.keys || {})[keyName];
+    if (!p)
+      throw new Error(
+        `Unknown key '${keyName}'. Available: ${Object.keys(HOSTS_CONFIG.keys || {}).join(", ") || "(hosts.json not loaded)"}`,
+      );
+    // Cross-platform path normalization: tilde, forward slashes
+    let resolved = p;
+    if (resolved.startsWith("~/") || resolved.startsWith("~\\")) {
+      resolved = path.join(
+        process.env.HOME || process.env.USERPROFILE || "",
+        resolved.slice(2),
+      );
     }
-  },
-);
+    return path.normalize(resolved);
+  }
 
-server.tool(
-  "book_split",
-  "Split a large text file into chunks of ~N words each (default 3000). Saves chunks and a _meta.json index to the output directory. After splitting, use book_chunk to iterate through them.",
-  {
-    input_file: z
-      .string()
-      .describe("path to the source text file, e.g. '/path/to/book.txt'"),
-    output_dir: z
-      .string()
-      .describe(
-        "directory where chunks will be written, e.g. '/path/to/book/chunks'",
-      ),
-    words_per_chunk: z
-      .number()
-      .int()
-      .min(500)
-      .max(10000)
-      .default(3000)
-      .describe("target words per chunk (default 3000)"),
-  },
-  async ({ input_file, output_dir, words_per_chunk }) => {
-    try {
-      await fs.mkdir(output_dir, { recursive: true });
-      const text = await fs.readFile(input_file, "utf8");
-      const lines = text.split("\n");
-      const chunks = [];
-      let currentChunk = [];
-      let currentWords = 0;
-      let startLine = 1;
+  function buildSshArgs(hostKey) {
+    const h = (HOSTS_CONFIG.hosts || {})[hostKey];
+    if (!h)
+      throw new Error(
+        `Unknown host '${hostKey}'. Available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(hosts.json not loaded)"}`,
+      );
+    const user = h.user || "ubuntu";
+    return ["-i", resolveKeyPath(h.key), ...SSH_BASE_OPTS, `${user}@${h.ip}`];
+  }
 
-      // Sentence terminator followed by optional closing punctuation (straight
-      // and curly quotes, guillemets, right brackets) and end-of-line.
-      // Catches: . ! ? … ." ?» !) …" — common in Polish/dialog texts.
-      const SENTENCE_END = /[.!?\u2026][\s"'\u201D\u2019\u00BB\u203A)\]]*\s*$/;
+  server.tool(
+    "postgres_query",
+    "Run a SQL query on a PostgreSQL database over SSH on a remote host from hosts.json. Uses psql via 'sudo -u postgres', so no password is needed (passwordless sudo required on the remote). SELECT returns data; DML/DDL also work - be careful on production databases. format='json' wraps SELECT/WITH queries with json_agg and returns a real JSON array.",
+    {
+      host: z
+        .string()
+        .describe(
+          `host from hosts.json - available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none - hosts.json not loaded)"}`,
+        ),
+      database: z
+        .string()
+        .describe("database name, e.g. 'mydb' or 'app_production'"),
+      query: z
+        .string()
+        .describe(
+          "SQL query, e.g. \"SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '1 day'\"",
+        ),
+      format: z
+        .enum(["table", "csv", "json"])
+        .default("table")
+        .describe(
+          "Output format. 'table' = psql aligned text; 'csv' = psql --csv; 'json' = real JSON array (SELECT/WITH only).",
+        ),
+    },
+    async ({ host, database, query, format }) => {
+      try {
+        const sshArgs = buildSshArgs(host);
+        if (!/^[a-zA-Z0-9_]+$/.test(database)) {
+          throw new Error(
+            `Invalid database name: must match [a-zA-Z0-9_]+, got '${database}'`,
+          );
+        }
+        let finalQuery = query;
+        let fmtFlag = "";
+        if (format === "csv") {
+          fmtFlag = "--csv";
+        } else if (format === "json") {
+          const trimmed = query.trim().replace(/;+\s*$/, "");
+          if (!/^\s*(select|with)\b/i.test(trimmed)) {
+            throw new Error(
+              "format='json' only works with SELECT or WITH queries",
+            );
+          }
+          finalQuery = `SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (${trimmed}) t;`;
+          fmtFlag = "-A -t";
+        }
+        // pass SQL via base64 -> stdin to avoid any shell quoting nightmares
+        const sqlB64 = Buffer.from(finalQuery, "utf8").toString("base64");
+        const remoteCmd = `cd /tmp && echo ${sqlB64} | base64 -d | sudo -u postgres psql -d ${database} ${fmtFlag}`;
+        const { stdout, stderr } = await execFileAsync(
+          "ssh",
+          [...sshArgs, remoteCmd],
+          { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
+        );
+        const parts = [];
+        if (stdout) parts.push(stdout);
+        if (stderr) parts.push(`--- stderr ---\n${stderr}`);
+        return {
+          content: [{ type: "text", text: parts.join("\n") || "(no output)" }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
 
-      for (let i = 0; i < lines.length; i++) {
-        const lineWords = lines[i].split(/\s+/).filter(Boolean).length;
-        currentChunk.push(lines[i]);
-        currentWords += lineWords;
-        // primary boundary: empty line after reaching target
-        // fallback: any line ending with sentence terminator after 1.5x target
-        // hard cap: 2x target on any line break
-        const onEmpty =
-          currentWords >= words_per_chunk && lines[i].trim() === "";
-        const onSentence =
-          currentWords >= words_per_chunk * 1.5 && SENTENCE_END.test(lines[i]);
-        const onHardCap = currentWords >= words_per_chunk * 2;
-        if (onEmpty || onSentence || onHardCap) {
+  server.tool(
+    "pm2_status",
+    "Show PM2 status (process list and optionally recent logs) on a remote host. Quick diagnostics: 'pm2_status host=production' or with logs 'pm2_status host=production app=myapp lines=100'. Requires PM2 installed on the remote (under NVM is fine - nvm.sh is auto-sourced).",
+    {
+      host: z
+        .string()
+        .describe(
+          `host from hosts.json - available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none - hosts.json not loaded)"}`,
+        ),
+      app: z
+        .string()
+        .optional()
+        .describe(
+          "specific PM2 app name (if you want logs for one app only). Omit for process list only.",
+        ),
+      lines: z
+        .number()
+        .int()
+        .min(0)
+        .max(500)
+        .default(0)
+        .describe("how many log lines to show. 0 = no logs (list only)"),
+    },
+    async ({ host, app, lines }) => {
+      try {
+        const sshArgs = buildSshArgs(host);
+        const buildRemote = (cmd) => {
+          const script = [
+            'export NVM_DIR="$HOME/.nvm"',
+            '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"',
+            'export PATH="$PATH:/usr/local/bin:/usr/bin"',
+            cmd,
+          ].join("\n");
+          const b64 = Buffer.from(script).toString("base64");
+          return `echo ${b64} | base64 -d | bash`;
+        };
+        const remoteCmds = [buildRemote("pm2 list")];
+        if (lines > 0) {
+          const target = app ? app : "all";
+          remoteCmds.push(
+            buildRemote(`pm2 logs ${target} --lines ${lines} --nostream`),
+          );
+        }
+        const outputs = [];
+        for (const rc of remoteCmds) {
+          const { stdout, stderr } = await execFileAsync(
+            "ssh",
+            [...sshArgs, rc],
+            { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
+          );
+          const partOut = [];
+          if (stdout) partOut.push(stdout);
+          if (stderr) partOut.push(`--- stderr ---\n${stderr}`);
+          outputs.push(partOut.join("\n") || "(no output)");
+        }
+        return {
+          content: [{ type: "text", text: outputs.join("\n\n---\n\n") }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "book_chunk",
+    "Read one chunk of a large text file (e.g. a book) that was pre-split into ~3000-word chunks by book_split. Use iteratively to read through a whole document that does not fit in the context window. Returns the chunk text plus metadata (chunk_index, total_chunks, line_range).",
+    {
+      book_dir: z
+        .string()
+        .describe("directory containing chunks, e.g. '/path/to/book/chunks'"),
+      chunk_index: z
+        .number()
+        .int()
+        .min(0)
+        .describe("which chunk to read (0-indexed)"),
+    },
+    async ({ book_dir, chunk_index }) => {
+      try {
+        const meta = JSON.parse(
+          await fs.readFile(path.join(book_dir, "_meta.json"), "utf8"),
+        );
+        if (chunk_index >= meta.total_chunks) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `End of document. Total chunks: ${meta.total_chunks}`,
+              },
+            ],
+          };
+        }
+        const chunkPath = path.join(
+          book_dir,
+          `chunk_${String(chunk_index).padStart(4, "0")}.txt`,
+        );
+        const text = await fs.readFile(chunkPath, "utf8");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `[CHUNK ${chunk_index + 1}/${meta.total_chunks}, lines ${meta.chunks[chunk_index].start_line}-${meta.chunks[chunk_index].end_line}]\n\n${text}`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `ERROR: ${e.message}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "book_split",
+    "Split a large text file into chunks of ~N words each (default 3000). Saves chunks and a _meta.json index to the output directory. After splitting, use book_chunk to iterate through them.",
+    {
+      input_file: z
+        .string()
+        .describe("path to the source text file, e.g. '/path/to/book.txt'"),
+      output_dir: z
+        .string()
+        .describe(
+          "directory where chunks will be written, e.g. '/path/to/book/chunks'",
+        ),
+      words_per_chunk: z
+        .number()
+        .int()
+        .min(500)
+        .max(10000)
+        .default(3000)
+        .describe("target words per chunk (default 3000)"),
+    },
+    async ({ input_file, output_dir, words_per_chunk }) => {
+      try {
+        await fs.mkdir(output_dir, { recursive: true });
+        const text = await fs.readFile(input_file, "utf8");
+        const lines = text.split("\n");
+        const chunks = [];
+        let currentChunk = [];
+        let currentWords = 0;
+        let startLine = 1;
+
+        // Sentence terminator followed by optional closing punctuation (straight
+        // and curly quotes, guillemets, right brackets) and end-of-line.
+        // Catches: . ! ? … ." ?» !) …" — common in Polish/dialog texts.
+        const SENTENCE_END =
+          /[.!?\u2026][\s"'\u201D\u2019\u00BB\u203A)\]]*\s*$/;
+
+        for (let i = 0; i < lines.length; i++) {
+          const lineWords = lines[i].split(/\s+/).filter(Boolean).length;
+          currentChunk.push(lines[i]);
+          currentWords += lineWords;
+          // primary boundary: empty line after reaching target
+          // fallback: any line ending with sentence terminator after 1.5x target
+          // hard cap: 2x target on any line break
+          const onEmpty =
+            currentWords >= words_per_chunk && lines[i].trim() === "";
+          const onSentence =
+            currentWords >= words_per_chunk * 1.5 &&
+            SENTENCE_END.test(lines[i]);
+          const onHardCap = currentWords >= words_per_chunk * 2;
+          if (onEmpty || onSentence || onHardCap) {
+            chunks.push({
+              start_line: startLine,
+              end_line: i + 1,
+              words: currentWords,
+              lines: currentChunk,
+            });
+            currentChunk = [];
+            currentWords = 0;
+            startLine = i + 2;
+          }
+        }
+        if (currentChunk.length > 0) {
           chunks.push({
             start_line: startLine,
-            end_line: i + 1,
+            end_line: lines.length,
             words: currentWords,
             lines: currentChunk,
           });
-          currentChunk = [];
-          currentWords = 0;
-          startLine = i + 2;
         }
-      }
-      if (currentChunk.length > 0) {
-        chunks.push({
-          start_line: startLine,
-          end_line: lines.length,
-          words: currentWords,
-          lines: currentChunk,
-        });
-      }
 
-      for (let i = 0; i < chunks.length; i++) {
-        const filename = path.join(
-          output_dir,
-          `chunk_${String(i).padStart(4, "0")}.txt`,
-        );
-        await fs.writeFile(filename, chunks[i].lines.join("\n"), "utf8");
-      }
-
-      const meta = {
-        input_file,
-        total_chunks: chunks.length,
-        total_lines: lines.length,
-        words_per_chunk,
-        chunks: chunks.map((c) => ({
-          start_line: c.start_line,
-          end_line: c.end_line,
-          words: c.words,
-        })),
-        created_at: new Date().toISOString(),
-      };
-      await fs.writeFile(
-        path.join(output_dir, "_meta.json"),
-        JSON.stringify(meta, null, 2),
-        "utf8",
-      );
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `OK - split into ${chunks.length} chunks of ~${words_per_chunk} words. Meta: ${path.join(output_dir, "_meta.json")}`,
-          },
-        ],
-      };
-    } catch (e) {
-      return {
-        content: [{ type: "text", text: `ERROR: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
-);
-
-server.tool(
-  "book_note",
-  "Read/write structured notes for a long document in a JSON file (_notes.json in book_dir). Useful for tracking glossaries, chapter summaries, TODO lists, inconsistencies found while iterating through a long text. Operations: get (read the whole JSON or one key), set (overwrite a key), append (push to a list under a key). Keys support dot-notation for nesting (e.g. 'summaries.chapter_1').",
-  {
-    book_dir: z
-      .string()
-      .describe(
-        "book directory (where _notes.json lives), e.g. '/path/to/book'",
-      ),
-    operation: z.enum(["get", "set", "append"]).describe("get | set | append"),
-    key: z
-      .string()
-      .optional()
-      .describe(
-        "JSON key with optional dot-notation, e.g. 'characters' or 'summaries.chapter_1'",
-      ),
-    value: z
-      .any()
-      .optional()
-      .describe(
-        "value to write (string, object, array) - required for set/append",
-      ),
-  },
-  async ({ book_dir, operation, key, value }) => {
-    try {
-      const notesFile = path.join(book_dir, "_notes.json");
-      let notes = {};
-      try {
-        notes = JSON.parse(await fs.readFile(notesFile, "utf8"));
-      } catch {}
-
-      if (operation === "get") {
-        if (!key)
-          return {
-            content: [{ type: "text", text: JSON.stringify(notes, null, 2) }],
-          };
-        const keys = key.split(".");
-        if (
-          keys.some((k) =>
-            ["__proto__", "constructor", "prototype"].includes(k),
-          )
-        ) {
-          throw new Error(`Forbidden key segment in '${key}'`);
+        for (let i = 0; i < chunks.length; i++) {
+          const filename = path.join(
+            output_dir,
+            `chunk_${String(i).padStart(4, "0")}.txt`,
+          );
+          await fs.writeFile(filename, chunks[i].lines.join("\n"), "utf8");
         }
-        const val = keys.reduce(
-          (o, k) =>
-            o && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined,
-          notes,
+
+        const meta = {
+          input_file,
+          total_chunks: chunks.length,
+          total_lines: lines.length,
+          words_per_chunk,
+          chunks: chunks.map((c) => ({
+            start_line: c.start_line,
+            end_line: c.end_line,
+            words: c.words,
+          })),
+          created_at: new Date().toISOString(),
+        };
+        await fs.writeFile(
+          path.join(output_dir, "_meta.json"),
+          JSON.stringify(meta, null, 2),
+          "utf8",
         );
+
         return {
           content: [
-            { type: "text", text: JSON.stringify(val, null, 2) ?? "null" },
+            {
+              type: "text",
+              text: `OK - split into ${chunks.length} chunks of ~${words_per_chunk} words. Meta: ${path.join(output_dir, "_meta.json")}`,
+            },
           ],
         };
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `ERROR: ${e.message}` }],
+          isError: true,
+        };
       }
+    },
+  );
 
-      const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-      const validatePath = (keys) => {
-        for (const k of keys) {
-          if (FORBIDDEN_KEYS.has(k)) {
-            throw new Error(`Forbidden key segment: '${k}'`);
-          }
-        }
-      };
+  server.tool(
+    "book_note",
+    "Read/write structured notes for a long document in a JSON file (_notes.json in book_dir). Useful for tracking glossaries, chapter summaries, TODO lists, inconsistencies found while iterating through a long text. Operations: get (read the whole JSON or one key), set (overwrite a key), append (push to a list under a key). Keys support dot-notation for nesting (e.g. 'summaries.chapter_1').",
+    {
+      book_dir: z
+        .string()
+        .describe(
+          "book directory (where _notes.json lives), e.g. '/path/to/book'",
+        ),
+      operation: z
+        .enum(["get", "set", "append"])
+        .describe("get | set | append"),
+      key: z
+        .string()
+        .optional()
+        .describe(
+          "JSON key with optional dot-notation, e.g. 'characters' or 'summaries.chapter_1'",
+        ),
+      value: z
+        .any()
+        .optional()
+        .describe(
+          "value to write (string, object, array) - required for set/append",
+        ),
+    },
+    async ({ book_dir, operation, key, value }) => {
+      try {
+        const notesFile = path.join(book_dir, "_notes.json");
+        let notes = {};
+        try {
+          notes = JSON.parse(await fs.readFile(notesFile, "utf8"));
+        } catch {}
 
-      if (operation === "set") {
-        const keys = key.split(".");
-        validatePath(keys);
-        let obj = notes;
-        for (let i = 0; i < keys.length - 1; i++) {
+        if (operation === "get") {
+          if (!key)
+            return {
+              content: [{ type: "text", text: JSON.stringify(notes, null, 2) }],
+            };
+          const keys = key.split(".");
           if (
-            !Object.prototype.hasOwnProperty.call(obj, keys[i]) ||
-            typeof obj[keys[i]] !== "object" ||
-            obj[keys[i]] === null
+            keys.some((k) =>
+              ["__proto__", "constructor", "prototype"].includes(k),
+            )
           ) {
-            obj[keys[i]] = {};
+            throw new Error(`Forbidden key segment in '${key}'`);
           }
-          obj = obj[keys[i]];
+          const val = keys.reduce(
+            (o, k) =>
+              o && Object.prototype.hasOwnProperty.call(o, k)
+                ? o[k]
+                : undefined,
+            notes,
+          );
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(val, null, 2) ?? "null" },
+            ],
+          };
         }
-        obj[keys[keys.length - 1]] = value;
-      }
 
-      if (operation === "append") {
-        const keys = key.split(".");
-        validatePath(keys);
-        let obj = notes;
-        for (let i = 0; i < keys.length - 1; i++) {
-          if (
-            !Object.prototype.hasOwnProperty.call(obj, keys[i]) ||
-            typeof obj[keys[i]] !== "object" ||
-            obj[keys[i]] === null
-          ) {
-            obj[keys[i]] = {};
+        const FORBIDDEN_KEYS = new Set([
+          "__proto__",
+          "constructor",
+          "prototype",
+        ]);
+        const validatePath = (keys) => {
+          for (const k of keys) {
+            if (FORBIDDEN_KEYS.has(k)) {
+              throw new Error(`Forbidden key segment: '${k}'`);
+            }
           }
-          obj = obj[keys[i]];
-        }
-        const k = keys[keys.length - 1];
-        if (!Array.isArray(obj[k])) obj[k] = [];
-        obj[k].push(value);
-      }
+        };
 
-      await fs.writeFile(notesFile, JSON.stringify(notes, null, 2), "utf8");
-      return { content: [{ type: "text", text: `OK ${operation} ${key}` }] };
-    } catch (e) {
-      return {
-        content: [{ type: "text", text: `ERROR: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
-);
+        if (operation === "set") {
+          const keys = key.split(".");
+          validatePath(keys);
+          let obj = notes;
+          for (let i = 0; i < keys.length - 1; i++) {
+            if (
+              !Object.prototype.hasOwnProperty.call(obj, keys[i]) ||
+              typeof obj[keys[i]] !== "object" ||
+              obj[keys[i]] === null
+            ) {
+              obj[keys[i]] = {};
+            }
+            obj = obj[keys[i]];
+          }
+          obj[keys[keys.length - 1]] = value;
+        }
+
+        if (operation === "append") {
+          const keys = key.split(".");
+          validatePath(keys);
+          let obj = notes;
+          for (let i = 0; i < keys.length - 1; i++) {
+            if (
+              !Object.prototype.hasOwnProperty.call(obj, keys[i]) ||
+              typeof obj[keys[i]] !== "object" ||
+              obj[keys[i]] === null
+            ) {
+              obj[keys[i]] = {};
+            }
+            obj = obj[keys[i]];
+          }
+          const k = keys[keys.length - 1];
+          if (!Array.isArray(obj[k])) obj[k] = [];
+          obj[k].push(value);
+        }
+
+        await fs.writeFile(notesFile, JSON.stringify(notes, null, 2), "utf8");
+        return { content: [{ type: "text", text: `OK ${operation} ${key}` }] };
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `ERROR: ${e.message}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  return server;
+}
 
 function normalizeIp(ip) {
   if (!ip) return "";
@@ -1263,10 +1333,14 @@ const mcpHandler = async (req, res) => {
     );
     return res.status(401).end();
   }
+  const server = createMcpServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   });
-  res.on("close", () => transport.close());
+  res.on("close", () => {
+    transport.close();
+    server.close();
+  });
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
 };
