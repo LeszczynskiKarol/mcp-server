@@ -68,6 +68,44 @@ one).
 
 NEVER run `pm2 ...` commands locally on this host. PM2 is gone here.
 
+## Named hosts and AWS SG auto-sync
+
+`ssh_exec` accepts two call forms:
+
+- **Preferred:** `host=<name from hosts.json>` (e.g. `host=matury`). No `key`
+  or `user` needed — both come from hosts.json. The tool's description string
+  lists the available named hosts at call time, so Claude.ai sees them in the
+  schema directly.
+- **Legacy:** `host=<raw IP/DNS>` + `key=<key name>`. Skips SG sync — you
+  manage AWS allowlisting yourself.
+
+`pm2_status` and `postgres_query` already use the named-host form (it's the
+only way they accept input).
+
+When a host entry has `security_group_id` (and optionally `region`, defaults
+to `eu-central-1`), every `ssh_exec` / `pm2_status` / `postgres_query` call
+runs `ensureSshAccess(host)` first. That helper:
+
+1. Fetches the local public IP from api.ipify.org (5s timeout).
+2. Lists current SG ingress rules on port 22.
+3. Adds the local IP/32 with `Description='mcp-auto-ssh'` if missing.
+4. Revokes any other /32 rules tagged `mcp-auto-ssh` (stale entries from
+   previous home-IP sessions).
+5. Caches the result per SG for `SG_CHECK_TTL_MS` (default 60000ms) to avoid
+   hammering the AWS API on each tool call.
+
+Failure modes are non-fatal — if AWS API errors out (credentials missing,
+network down, throttling), `ensureSshAccess` warns to stderr and returns
+null. The SSH attempt proceeds against whatever ACL is currently in place.
+This mirrors the deploy.yml pattern from matury-online's GitHub Actions.
+
+The local AWS CLI profile (from `~/.aws/credentials` or env vars) must have
+`ec2:DescribeSecurityGroups`, `ec2:AuthorizeSecurityGroupIngress`,
+`ec2:RevokeSecurityGroupIngress` on the configured SG.
+
+To disable for one host: remove `security_group_id` from its hosts.json
+entry. To disable globally: don't set `security_group_id` on any host.
+
 ## OAuth / Express specifics
 
 - Tokens stored sha256-hashed. The migration code in `loadOauthState`

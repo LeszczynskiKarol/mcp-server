@@ -1,17 +1,19 @@
 {
-  "_comment": "Hosts available to ssh_exec, postgres_query, pm2_status. 'key' references an entry in the 'keys' section below.",
+  "_comment": "Hosts available to ssh_exec, postgres_query, pm2_status. 'key' references an entry in the 'keys' section below. Optional 'security_group_id' + 'region' enable automatic SSH/22 access management for the current public IP (auto-adds tagged 'mcp-auto-ssh' rule, auto-revokes stale tagged rules). Requires AWS CLI configured locally with EC2 permissions.",
   "hosts": {
     "production": {
       "ip": "1.2.3.4",
       "user": "ubuntu",
       "key": "main",
+      "security_group_id": "sg-0123456789abcdef0",
+      "region": "eu-central-1",
       "description": "Main production server"
     },
     "staging": {
       "ip": "5.6.7.8",
       "user": "ubuntu",
       "key": "main",
-      "description": "Staging environment"
+      "description": "Staging environment (no AWS SG management)"
     }
   },
   "_comment_keys": "Mapping of key names to .pem file paths. Forward slashes work cross-platform. Tilde (~) is expanded to $HOME or %USERPROFILE%.",

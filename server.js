@@ -52,6 +52,8 @@ if (
             user: z.string().optional(),
             key: z.string().min(1),
             description: z.string().optional(),
+            security_group_id: z.string().optional(),
+            region: z.string().optional(),
           }),
         )
         .optional()
@@ -327,6 +329,135 @@ setInterval(() => {
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
+// === Security group SSH access auto-sync ===
+// When a host in hosts.json has 'security_group_id' set, ssh_exec / pm2_status /
+// postgres_query call ensureSshAccess(hostKey) before connecting. It fetches the
+// local machine's public IP, adds a tagged rule (Description='mcp-auto-ssh') to
+// the SG on port 22, and revokes any other rules with the same tag (stale IPs
+// from previous sessions). Result cached for SG_CHECK_TTL_MS to avoid hitting
+// the AWS API on every call. Falls back gracefully (warn + null) on any AWS
+// error so the SSH attempt still runs.
+const SG_CHECK_TTL_MS = parseInt(process.env.SG_CHECK_TTL_MS || "60000", 10);
+const SG_AUTO_TAG = "mcp-auto-ssh";
+const sgCheckCache = new Map(); // sg_id -> { until: ms, ip }
+
+async function syncSecurityGroupSsh(sgId, region) {
+  const r = region || "eu-central-1";
+  const ipResp = await fetch("https://api.ipify.org", {
+    signal: AbortSignal.timeout(5000),
+  });
+  const myIp = (await ipResp.text()).trim();
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/.test(myIp)) {
+    throw new Error(`Got invalid public IP from ipify: ${myIp}`);
+  }
+  const myCidr = `${myIp}/32`;
+  const { stdout } = await execFileAsync(
+    "aws",
+    [
+      "ec2",
+      "describe-security-groups",
+      "--group-ids",
+      sgId,
+      "--region",
+      r,
+      "--output",
+      "json",
+    ],
+    { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
+  );
+  const sgData = JSON.parse(stdout);
+  const sshPermission = (sgData.SecurityGroups[0].IpPermissions || []).find(
+    (p) => p.IpProtocol === "tcp" && p.FromPort === 22 && p.ToPort === 22,
+  );
+  let alreadyExists = false;
+  const staleRules = [];
+  if (sshPermission) {
+    for (const range of sshPermission.IpRanges || []) {
+      if (range.CidrIp === myCidr) alreadyExists = true;
+      else if (range.Description === SG_AUTO_TAG)
+        staleRules.push(range.CidrIp);
+    }
+  }
+  if (staleRules.length > 0) {
+    const revokeIpPerm = JSON.stringify([
+      {
+        IpProtocol: "tcp",
+        FromPort: 22,
+        ToPort: 22,
+        IpRanges: staleRules.map((cidr) => ({ CidrIp: cidr })),
+      },
+    ]);
+    try {
+      await execFileAsync(
+        "aws",
+        [
+          "ec2",
+          "revoke-security-group-ingress",
+          "--group-id",
+          sgId,
+          "--region",
+          r,
+          "--ip-permissions",
+          revokeIpPerm,
+        ],
+        { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
+      );
+    } catch (e) {
+      console.warn(`[sg-sync] revoke stale rules failed: ${e.message}`);
+    }
+  }
+  if (!alreadyExists) {
+    const authIpPerm = JSON.stringify([
+      {
+        IpProtocol: "tcp",
+        FromPort: 22,
+        ToPort: 22,
+        IpRanges: [{ CidrIp: myCidr, Description: SG_AUTO_TAG }],
+      },
+    ]);
+    await execFileAsync(
+      "aws",
+      [
+        "ec2",
+        "authorize-security-group-ingress",
+        "--group-id",
+        sgId,
+        "--region",
+        r,
+        "--ip-permissions",
+        authIpPerm,
+      ],
+      { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
+    );
+  }
+  return { ip: myIp, added: !alreadyExists, revoked_stale: staleRules.length };
+}
+
+async function ensureSshAccess(hostKey) {
+  const h = (HOSTS_CONFIG.hosts || {})[hostKey];
+  if (!h || !h.security_group_id) return null;
+  const cached = sgCheckCache.get(h.security_group_id);
+  if (cached && cached.until > Date.now())
+    return { cached: true, ip: cached.ip };
+  try {
+    const result = await syncSecurityGroupSsh(h.security_group_id, h.region);
+    sgCheckCache.set(h.security_group_id, {
+      until: Date.now() + SG_CHECK_TTL_MS,
+      ip: result.ip,
+    });
+    console.log(
+      `[sg-sync] ${hostKey} (${h.security_group_id}): IP=${result.ip} added=${result.added} revoked_stale=${result.revoked_stale}`,
+    );
+    return result;
+  } catch (e) {
+    console.warn(
+      `[sg-sync] ${hostKey} failed (continuing with stale ACL): ${e.message}`,
+    );
+    return null;
+  }
+}
+
+
 function safeCompare(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
   const aBuf = Buffer.from(a);
@@ -424,23 +555,43 @@ function createMcpServer() {
 
   server.tool(
     "ssh_exec",
-    "Run a shell command on a remote host over SSH using a key defined in hosts.json (the 'keys' section). Host is any IP or DNS, user defaults to 'ubuntu'.",
+    `Run a shell command on a remote host over SSH. Two ways to specify the target:\n\n(A) PREFERRED: pass host=<name from hosts.json> only — no 'key' or 'user' needed (defaults from hosts.json). Named hosts available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none - hosts.json not loaded)"}. If the host has 'security_group_id' set in hosts.json, the local public IP is auto-added to that SG on port 22 (and any stale rules tagged 'mcp-auto-ssh' from previous sessions are revoked) before connecting. Result cached 60s.\n\n(B) Legacy: pass host=<raw IP or DNS> AND key=<name from hosts.json 'keys' section>. No SG management.`,
     {
-      key: z
-        .string()
-        .describe("key name from hosts.json (e.g. 'main', 'production-key')"),
-      user: z.string().default("ubuntu").describe("SSH user (default: ubuntu)"),
       host: z
         .string()
-        .describe("IP or DNS, e.g. '1.2.3.4' or 'server.example.com'"),
+        .describe(
+          `name from hosts.json (preferred) OR raw IP/DNS. Named hosts: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none)"}`,
+        ),
+      key: z
+        .string()
+        .optional()
+        .describe(
+          "ONLY required if 'host' is a raw IP/DNS. Key name from hosts.json 'keys' section.",
+        ),
+      user: z
+        .string()
+        .default("ubuntu")
+        .describe("SSH user (default: ubuntu, ignored for named hosts)"),
       command: z.string().describe("shell command to run on the remote host"),
     },
-    async ({ key, user, host, command }) => {
+    async ({ host, key, user, command }) => {
       try {
-        const keyPath = resolveKeyPath(key);
+        let sshArgs;
+        if ((HOSTS_CONFIG.hosts || {})[host]) {
+          await ensureSshAccess(host);
+          sshArgs = buildSshArgs(host);
+        } else {
+          if (!key) {
+            throw new Error(
+              `host '${host}' not found in hosts.json. Either use a known host (${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "none configured"}) or pass 'key' for raw IP/DNS access.`,
+            );
+          }
+          const keyPath = resolveKeyPath(key);
+          sshArgs = ["-i", keyPath, ...SSH_BASE_OPTS, `${user}@${host}`];
+        }
         const { stdout, stderr } = await execFileAsync(
           "ssh",
-          ["-i", keyPath, ...SSH_BASE_OPTS, `${user}@${host}`, command],
+          [...sshArgs, command],
           { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
         );
         const parts = [];
@@ -797,6 +948,7 @@ function createMcpServer() {
     },
     async ({ host, database, query, format }) => {
       try {
+        await ensureSshAccess(host);
         const sshArgs = buildSshArgs(host);
         if (!/^[a-zA-Z0-9_]+$/.test(database)) {
           throw new Error(
@@ -867,6 +1019,7 @@ function createMcpServer() {
     },
     async ({ host, app, lines }) => {
       try {
+        await ensureSshAccess(host);
         const sshArgs = buildSshArgs(host);
         const buildRemote = (cmd) => {
           const script = [
