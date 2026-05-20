@@ -472,6 +472,26 @@ function createMcpServer() {
       cwd: z.string().optional().describe("working directory (optional)"),
     },
     async ({ command, cwd }) => {
+      // Catch JSON-escape disasters in command strings the same way write_file
+      // catches them in paths: a TAB / CR / LF that crept in via single backslash
+      // in JSON (e.g. "D:\\tmp" -> literal TAB). Cmd.exe sometimes silently
+      // normalizes (splits the path on TAB) producing surprising behavior; bash
+      // never does. Reject early with the same diagnostic message.
+      if (/[\t\r\n\0\v\f]/.test(command)) {
+        const codes = [...command]
+          .slice(0, 60)
+          .map((c) => c.charCodeAt(0).toString(16).padStart(2, "0"))
+          .join(" ");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `ERROR: command contains control character (TAB/CR/LF/NUL). Likely a JSON-escape bug — you probably wrote "D:\\temp" instead of "D:\\\\temp" or "D:/temp". First 60 bytes (hex): ${codes}`,
+            },
+          ],
+          isError: true,
+        };
+      }
       try {
         const { stdout, stderr } = await execAsync(command, {
           maxBuffer: EXEC_BUFFER,
@@ -532,35 +552,50 @@ function createMcpServer() {
       // being truncated mid-stream by client output limits or overload retries.
       // For mega-files, the caller MUST chunk via mode=append. This prevents
       // silent corruption where only part of intended content lands on disk.
-      const sizeBytes = Buffer.byteLength(content, 'utf8');
+      const sizeBytes = Buffer.byteLength(content, "utf8");
       const HARD_LIMIT = 50 * 1024;
       const WARN_LIMIT = 30 * 1024;
-      if (sizeBytes > HARD_LIMIT && mode === 'overwrite') {
+      if (sizeBytes > HARD_LIMIT && mode === "overwrite") {
         return {
-          content: [{
-            type: 'text',
-            text:
-              'ERROR: content size ' + (sizeBytes / 1024).toFixed(1) + ' KB ' +
-              'exceeds single-write hard limit (' + (HARD_LIMIT / 1024) + ' KB). ' +
-              'This write would risk being truncated by output limits or ' +
-              'overload retries.\\n\\n' +
-              'REQUIRED FIX: chunk the content.\\n' +
-              '1. First call: write_file mode=\"overwrite\" with first ~20-30 KB ' +
-              '(opening structure + first section)\\n' +
-              '2. Subsequent calls: write_file mode=\"append\", each ~20-30 KB chunk\\n' +
-              '3. Final call: write_file mode=\"append\" with closing structure\\n\\n' +
-              'If you got this error after a previous chunk succeeded, your retry ' +
-              'was using overwrite mode - switch to append.'
-          }],
+          content: [
+            {
+              type: "text",
+              text:
+                "ERROR: content size " +
+                (sizeBytes / 1024).toFixed(1) +
+                " KB " +
+                "exceeds single-write hard limit (" +
+                HARD_LIMIT / 1024 +
+                " KB). " +
+                "This write would risk being truncated by output limits or " +
+                "overload retries.\\n\\n" +
+                "REQUIRED FIX: chunk the content.\\n" +
+                '1. First call: write_file mode=\"overwrite\" with first ~20-30 KB ' +
+                "(opening structure + first section)\\n" +
+                '2. Subsequent calls: write_file mode=\"append\", each ~20-30 KB chunk\\n' +
+                '3. Final call: write_file mode=\"append\" with closing structure\\n\\n' +
+                "If you got this error after a previous chunk succeeded, your retry " +
+                "was using overwrite mode - switch to append.",
+            },
+          ],
           isError: true,
         };
       }
       if (sizeBytes > WARN_LIMIT) {
-        console.warn(`[write_file] large content ${(sizeBytes / 1024).toFixed(1)} KB to ${filePath} - consider chunking`);
+        console.warn(
+          `[write_file] large content ${(sizeBytes / 1024).toFixed(1)} KB to ${filePath} - consider chunking`,
+        );
       }
       try {
         const dir = path.dirname(filePath);
-        await fs.mkdir(dir, { recursive: true });
+        // Only mkdir for actual subdirectories. path.dirname returns the drive root
+        // (e.g. 'D:/' or 'C:\\') when the file lives directly on the root \u2014 fs.mkdir
+        // would throw EPERM trying to 'create' the root. Skip in that case.
+        const isWindowsRoot = /^[A-Za-z]:[\\\\/]?$/.test(dir);
+        const isPosixRoot = dir === "/";
+        if (!isWindowsRoot && !isPosixRoot) {
+          await fs.mkdir(dir, { recursive: true });
+        }
         if (mode === "append") {
           await fs.appendFile(filePath, content, "utf8");
         } else {
