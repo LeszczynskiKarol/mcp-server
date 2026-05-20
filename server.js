@@ -22,6 +22,19 @@ process.on("unhandledRejection", (e) => {
   console.error("[unhandledRejection]", e);
 });
 
+// === Write PID file for watchdog/restart scripts ===
+try {
+  fsSync.writeFileSync(".pid", process.pid.toString());
+  const cleanup = () => {
+    try { fsSync.unlinkSync(".pid"); } catch {}
+  };
+  process.on("exit", cleanup);
+  process.on("SIGINT", () => { cleanup(); process.exit(0); });
+  process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+} catch (e) {
+  console.warn("[pid] failed to write .pid file: " + e.message);
+}
+
 // === Load hosts.json ===
 const HOSTS_CONFIG_PATH =
   process.env.HOSTS_CONFIG || path.join(process.cwd(), "hosts.json");

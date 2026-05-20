@@ -19,11 +19,25 @@ This file adds context specific to `mcp-server`.
   tokens (tokens stored sha256-hashed, never plaintext).
 - `known_hosts` — gitignored, SSH host fingerprints (pinned on first connect).
 - `logs/mcp.log` — gitignored.
+- `.pid` — gitignored, server.js writes its own PID here on boot. Used by
+  `restart-mcp.ps1` to find the exact node.exe to kill.
+- `restart-mcp.ps1` — selective restart (see Restart workflow below).
+- `watchdog.ps1` — runs every 2 minutes via Task Scheduler "MCP Server
+  Watchdog", respawns the server if both the node.exe AND its start-mcp.bat
+  loop are dead. Logs to `logs/watchdog.log`.
 
-Process supervision: Windows Task Scheduler at user logon →
-`start-mcp-hidden.vbs` → `start-mcp.bat` with `:loop ... node server.js ... goto loop`
-restart loop. **NO PM2 locally.** The `pm2_status` tool still works on remote
-hosts that DO use PM2 — that's fine, just not here.
+Process supervision:
+
+1. Task Scheduler "MCP Server" at user logon → `start-mcp-hidden.vbs` →
+   `start-mcp.bat` (which has `:loop ... node server.js ... goto loop`). This
+   handles normal `node` crashes — the loop respawns in ~5s.
+2. Task Scheduler "MCP Server Watchdog" every 2 minutes → `watchdog.ps1`.
+   This handles the case where the `start-mcp.bat` itself died (typically
+   from Ctrl+C in an interactive console). If no `mcp-server\server.js`
+   process is found, watchdog launches `start-mcp-hidden.vbs` again.
+
+**NO PM2 locally.** The `pm2_status` tool still works on remote hosts that
+DO use PM2 — that's fine, just not here.
 
 ## Verification per file type
 
@@ -31,7 +45,7 @@ After editing, run exactly this and nothing more:
 
 - `.js` → `node --check <plik>`. STOP.
 - `.json` → `node -e "JSON.parse(require('fs').readFileSync('<plik>','utf8'))"`. STOP.
-- `.md`, `.txt`, `.bat`, `.vbs`, `.sh`, `.yml` → no verification. Trust the write.
+- `.md`, `.txt`, `.bat`, `.vbs`, `.sh`, `.yml`, `.ps1` → no verification. Trust the write.
 
 Do NOT re-read the file to "make sure it saved". `write_file` returned bytes =
 it saved.
@@ -45,12 +59,28 @@ it saved.
 - NEVER `git push --force`, `git reset --hard`, or rewrite history without my
   explicit "ok".
 - NEVER commit `hosts.json`, `.env`, `oauth-state.json`, `known_hosts`,
-  `logs/`. They're gitignored — keep it that way.
+  `logs/`, `.pid`. They're gitignored — keep it that way.
 
 ## Restart workflow (this MCP server edits itself)
 
 Editing `D:\mcp-server\server.js` doesn't auto-reload — the running node
 process must be restarted. Restart kills your current MCP session.
+
+### CORRECT restart procedure (use this)
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\mcp-server\restart-mcp.ps1
+```
+
+This script:
+
+1. Reads `.pid` to find the exact MCP node.exe and stops only that PID.
+2. Falls back to scanning `Get-CimInstance Win32_Process` for node.exe
+   processes whose CommandLine matches `mcp-server\server.js` — selective
+   match, can't hit unrelated node processes.
+3. Waits 6s for `start-mcp.bat`'s `:loop` to respawn.
+4. If nothing came back up (loop is dead), launches
+   `start-mcp-hidden.vbs` fresh.
 
 After such a failure:
 
@@ -58,8 +88,16 @@ After such a failure:
 2. Tell me: "server restarted, send a new message to reconnect".
 3. Wait. Session resumes when I send any message.
 
-Restart procedure I run: `taskkill /F /IM node.exe` — the `:loop` in
-`start-mcp.bat` picks up a new node process within ~5 seconds.
+### NEVER do this — globally fatal
+
+```
+taskkill /F /IM node.exe       <-- KILLS EVERY node.exe ON THIS BOX
+```
+
+That includes any running **Claude Code** sessions (it's a node CLI),
+`npx`-launched MCP plugins, Vite/Astro/Next dev servers, etc. Use
+`restart-mcp.ps1` instead. The script's command-line filter ensures only the
+MCP node gets terminated.
 
 **New tools** added to `server.js` are NOT visible inside the current chat —
 the tool list is loaded once at conversation start. After adding a new tool:

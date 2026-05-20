@@ -13,6 +13,9 @@ mcp-task.generated.xml
 mcp-task.xml
 start-mcp-hidden.vbs
 
+# Runtime
+.pid
+
 # Logs
 logs/
 *.log
@@ -43,4 +46,4 @@ Thumbs.db
 # Build artifacts
 dist/
 build/
-known_hosts 
+known_hosts
