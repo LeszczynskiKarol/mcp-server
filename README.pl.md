@@ -31,6 +31,8 @@ Klucze SSH, GitHub PAT i AWS credentials **nigdy nie opuszczają lokalnej maszyn
 | `github_api`     | Request do GitHub REST API używając Personal Access Token                                                                                                         |
 | `postgres_query` | `psql` przez SSH (sudo -u postgres) na hoście z `hosts.json`                                                                                                      |
 | `pm2_status`     | `pm2 list` + opcjonalne logi na zdalnym hoście                                                                                                                    |
+| `sftp_download`  | Pobiera plik ze zdalnego hosta na lokalny dysk (przez persistent SSH pool). Niezbędne w Claude.ai web — sandbox w chmurze nie ma natywnego scp                    |
+| `sftp_upload`    | Wysyła lokalny plik na zdalny host. Opcjonalna flaga POSIX mode (np. `0755`). Folder docelowy musi istnieć po stronie serwera                                     |
 | `book_split`     | Dzieli duży plik tekstowy na chunki (~3000 słów)                                                                                                                  |
 | `book_chunk`     | Czyta jeden chunk z katalogu z `_meta.json`                                                                                                                       |
 | `book_note`      | Zarządza notatkami JSON dla iteracyjnej pracy nad książką                                                                                                         |

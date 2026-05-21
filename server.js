@@ -12,6 +12,7 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import fsSync from "fs";
 import path from "path";
+import { Client as SshClient } from "ssh2";
 import { config } from "dotenv";
 config();
 
@@ -27,6 +28,7 @@ try {
   fsSync.writeFileSync(".pid", process.pid.toString());
   const cleanup = () => {
     try { fsSync.unlinkSync(".pid"); } catch {}
+    try { closeAllSshPool(); } catch {}
   };
   process.on("exit", cleanup);
   process.on("SIGINT", () => { cleanup(); process.exit(0); });
@@ -184,6 +186,273 @@ const SSH_BASE_OPTS = [
   "-o",
   "ServerAliveInterval=30",
 ];
+
+// Module-level so the persistent SSH pool below can resolve key paths.
+// (Tool registrations later in the file also call these.)
+function resolveKeyPath(keyName) {
+  const p = (HOSTS_CONFIG.keys || {})[keyName];
+  if (!p)
+    throw new Error(
+      `Unknown key '${keyName}'. Available: ${Object.keys(HOSTS_CONFIG.keys || {}).join(", ") || "(hosts.json not loaded)"}`,
+    );
+  let resolved = p;
+  if (resolved.startsWith("~/") || resolved.startsWith("~\\")) {
+    resolved = path.join(
+      process.env.HOME || process.env.USERPROFILE || "",
+      resolved.slice(2),
+    );
+  }
+  return path.normalize(resolved);
+}
+
+function buildSshArgs(hostKey) {
+  const h = (HOSTS_CONFIG.hosts || {})[hostKey];
+  if (!h)
+    throw new Error(
+      `Unknown host '${hostKey}'. Available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(hosts.json not loaded)"}`,
+    );
+  const user = h.user || "ubuntu";
+  return ["-i", resolveKeyPath(h.key), ...SSH_BASE_OPTS, `${user}@${h.ip}`];
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Persistent SSH connection pool (ssh2)
+// ────────────────────────────────────────────────────────────────────────
+// Each named host gets one long-lived ssh2 Client kept in this Map. Calls
+// to execSsh(hostKey, cmd) reuse the existing connection instead of doing
+// a fresh TCP+TLS+auth handshake every time (which saves ~500ms per call).
+// Connections are evicted after SSH_IDLE_TIMEOUT_MS of inactivity, and
+// auto-closed on SIGINT/SIGTERM (see PID-cleanup section).
+// Windows OpenSSH ControlMaster is broken (named-pipe issues) so we keep
+// the persistence inside this process instead of relying on the ssh CLI.
+// ════════════════════════════════════════════════════════════════════════
+const SSH_POOL = new Map(); // hostKey -> { client, lastUsed, connecting }
+const SSH_IDLE_TIMEOUT_MS =
+  parseInt(process.env.SSH_IDLE_TIMEOUT_SECONDS || "300", 10) * 1000;
+
+// Periodic eviction of idle connections
+const sshPoolJanitor = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of SSH_POOL) {
+    if (entry.connecting) continue;
+    if (now - entry.lastUsed > SSH_IDLE_TIMEOUT_MS) {
+      try { entry.client.end(); } catch {}
+      SSH_POOL.delete(key);
+      console.log(`[ssh-pool] evicted idle: ${key}`);
+    }
+  }
+}, 60 * 1000);
+if (sshPoolJanitor.unref) sshPoolJanitor.unref();
+
+function closeAllSshPool() {
+  for (const [, entry] of SSH_POOL) {
+    try { entry.client.end(); } catch {}
+  }
+  SSH_POOL.clear();
+}
+
+// ── Shared validation helpers ─────────────────────────────────────────────
+// Detect control characters in paths/commands. Almost always indicates a
+// JSON-escape bug in tool arguments — caller sent `\t`, `\n`, `\r`, `\0`
+// expecting a literal backslash + letter but JSON parsed them as the actual
+// control characters (TAB, LF, CR, NUL). mkdir/exec would do garbage with
+// these. Single source of truth used by write_file, local_exec, sftp_upload,
+// sftp_download — keep all four call sites in sync.
+const PATH_CONTROL_CHAR_REGEX = /[\t\r\n\0\v\f]/;
+function hasControlChar(s) {
+  return typeof s === "string" && PATH_CONTROL_CHAR_REGEX.test(s);
+}
+
+// Postgres database names must be plain alphanumeric+underscore. Anything
+// else opens up SQL injection through the `-d ${database}` interpolation
+// in postgres_query. Lock it down with the same charset Postgres itself
+// accepts for unquoted identifiers.
+const VALID_DB_NAME_REGEX = /^[a-zA-Z0-9_]+$/;
+function isValidDatabaseName(name) {
+  return typeof name === "string" && VALID_DB_NAME_REGEX.test(name);
+}
+
+async function getSshClient(hostKey) {
+  const h = (HOSTS_CONFIG.hosts || {})[hostKey];
+  if (!h) {
+    throw new Error(
+      `Unknown host '${hostKey}'. Available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(hosts.json not loaded)"}`,
+    );
+  }
+
+  const existing = SSH_POOL.get(hostKey);
+  if (existing) {
+    if (existing.connecting) {
+      // Another caller is already connecting — wait for it.
+      // Important: after the await we check the CLIENT'S liveness, not
+      // `entry.connecting`. The original holder of the connecting promise
+      // hasn't necessarily cleared its flag yet (microtask ordering means
+      // our continuation can run before theirs), so a "still connecting"
+      // flag here is a false negative.
+      await existing.connecting;
+      const refreshed = SSH_POOL.get(hostKey);
+      if (refreshed && refreshed.client && refreshed.client._sock && !refreshed.client._sock.destroyed) {
+        refreshed.lastUsed = Date.now();
+        return refreshed.client;
+      }
+    } else {
+      // Probe: ssh2 doesn't expose a public liveness flag, but the underlying
+      // socket sets .destroyed when torn down.
+      const sock = existing.client._sock;
+      if (sock && !sock.destroyed) {
+        existing.lastUsed = Date.now();
+        return existing.client;
+      }
+      SSH_POOL.delete(hostKey);
+    }
+  }
+
+  // Reserve the pool slot BEFORE any await. Otherwise concurrent callers
+  // racing through `ensureSshAccess` / `fs.readFile` would each see an empty
+  // pool and spawn their own ssh2 Client (leaking N-1 connections).
+  let resolveReady, rejectReady;
+  const ready = new Promise((res, rej) => {
+    resolveReady = res;
+    rejectReady = rej;
+  });
+  const client = new SshClient();
+  const entry = { client, lastUsed: Date.now(), connecting: ready };
+  SSH_POOL.set(hostKey, entry);
+
+  // Drop entry from pool on any termination signal
+  client.on("close", () => {
+    SSH_POOL.delete(hostKey);
+  });
+  client.on("error", (err) => {
+    console.warn(`[ssh-pool] ${hostKey} error: ${err.message}`);
+    SSH_POOL.delete(hostKey);
+  });
+
+  // Wire ready/error → our promise resolvers
+  client.once("ready", () => resolveReady());
+  client.once("error", (err) => rejectReady(err));
+
+  try {
+    await ensureSshAccess(hostKey);
+    const keyPath = resolveKeyPath(h.key);
+    const privateKey = await fs.readFile(keyPath);
+
+    client.connect({
+      host: h.ip,
+      port: 22,
+      username: h.user || "ubuntu",
+      privateKey,
+      readyTimeout: 10_000,
+      keepaliveInterval: 30_000,
+      keepaliveCountMax: 3,
+    });
+
+    await ready;
+  } catch (err) {
+    SSH_POOL.delete(hostKey);
+    rejectReady(err);
+    throw err;
+  }
+  entry.connecting = null;
+  console.log(`[ssh-pool] new connection: ${hostKey} (${h.ip})`);
+  return client;
+}
+
+// Mimics execFileAsync's behavior: throws on non-zero exit with stdout/stderr
+// attached to the error, so existing error handlers keep working unchanged.
+async function execSsh(hostKey, command, opts = {}) {
+  const timeoutMs = opts.timeoutMs || EXEC_TIMEOUT_MS;
+  const maxBuffer = opts.maxBuffer || EXEC_BUFFER;
+  const client = await getSshClient(hostKey);
+
+  return await new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let truncated = false;
+    let stream;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { stream && stream.signal("TERM"); } catch {}
+      try { stream && stream.close(); } catch {}
+      const err = new Error(`Command timed out after ${timeoutMs}ms`);
+      err.stdout = stdout;
+      err.stderr = stderr;
+      reject(err);
+    }, timeoutMs);
+
+    client.exec(command, (err, s) => {
+      if (err) {
+        clearTimeout(timer);
+        return reject(err);
+      }
+      stream = s;
+
+      s.on("data", (chunk) => {
+        if (truncated) return;
+        if (stdout.length + chunk.length > maxBuffer) {
+          stdout += chunk.toString("utf8").slice(0, maxBuffer - stdout.length);
+          truncated = true;
+          try { s.close(); } catch {}
+        } else {
+          stdout += chunk.toString("utf8");
+        }
+      });
+      s.stderr.on("data", (chunk) => {
+        if (stderr.length + chunk.length > maxBuffer) {
+          stderr += chunk.toString("utf8").slice(0, maxBuffer - stderr.length);
+        } else {
+          stderr += chunk.toString("utf8");
+        }
+      });
+      s.on("close", (code, signal) => {
+        clearTimeout(timer);
+        if (timedOut) return;
+
+        // Refresh lastUsed on successful completion
+        const entry = SSH_POOL.get(hostKey);
+        if (entry) entry.lastUsed = Date.now();
+
+        if (code !== 0 && code != null) {
+          const e = new Error(
+            `Command failed with exit code ${code}${signal ? ` (signal ${signal})` : ""}`,
+          );
+          e.code = code;
+          e.signal = signal;
+          e.stdout = stdout;
+          e.stderr = stderr;
+          return reject(e);
+        }
+        resolve({ stdout, stderr, code, signal, truncated });
+      });
+      s.on("error", (e) => {
+        clearTimeout(timer);
+        if (!timedOut) reject(e);
+      });
+    });
+  });
+}
+
+// Open an SFTP session over the persistent SSH connection. The caller's
+// async fn gets the session; it is closed (sftp.end()) automatically when
+// fn settles, regardless of success or failure.
+//
+// SFTP channels are cheap to open once the SSH transport is up — no
+// handshake. We don't cache sftp sessions themselves; they're created per
+// transfer and torn down. The underlying ssh2.Client stays warm in the
+// SSH_POOL.
+async function withSftp(hostKey, fn) {
+  const client = await getSshClient(hostKey);
+  const sftp = await new Promise((resolve, reject) => {
+    client.sftp((err, s) => (err ? reject(err) : resolve(s)));
+  });
+  try {
+    return await fn(sftp);
+  } finally {
+    try { sftp.end(); } catch {}
+  }
+}
 
 // === OAuth state persistence ===
 const OAUTH_STATE_FILE =
@@ -376,7 +645,7 @@ async function syncSecurityGroupSsh(sgId, region) {
       "--output",
       "json",
     ],
-    { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
+    { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS, windowsHide: true },
   );
   const sgData = JSON.parse(stdout);
   const sshPermission = (sgData.SecurityGroups[0].IpPermissions || []).find(
@@ -413,7 +682,7 @@ async function syncSecurityGroupSsh(sgId, region) {
           "--ip-permissions",
           revokeIpPerm,
         ],
-        { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
+        { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS, windowsHide: true },
       );
     } catch (e) {
       console.warn(`[sg-sync] revoke stale rules failed: ${e.message}`);
@@ -440,13 +709,15 @@ async function syncSecurityGroupSsh(sgId, region) {
         "--ip-permissions",
         authIpPerm,
       ],
-      { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
+      { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS, windowsHide: true },
     );
   }
   return { ip: myIp, added: !alreadyExists, revoked_stale: staleRules.length };
 }
 
 async function ensureSshAccess(hostKey) {
+  // Tests don't hit real AWS — silently no-op when invoked under vitest.
+  if (process.env.MCP_TEST_MODE === "true") return null;
   const h = (HOSTS_CONFIG.hosts || {})[hostKey];
   if (!h || !h.security_group_id) return null;
   const cached = sgCheckCache.get(h.security_group_id);
@@ -551,6 +822,7 @@ function createMcpServer() {
         const { stdout, stderr } = await execFileAsync("aws", args, {
           maxBuffer: EXEC_BUFFER,
           timeout: EXEC_TIMEOUT_MS,
+          windowsHide: true,
         });
         return {
           content: [{ type: "text", text: stdout || stderr || "(no output)" }],
@@ -589,24 +861,25 @@ function createMcpServer() {
     },
     async ({ host, key, user, command }) => {
       try {
-        let sshArgs;
+        let stdout, stderr;
         if ((HOSTS_CONFIG.hosts || {})[host]) {
-          await ensureSshAccess(host);
-          sshArgs = buildSshArgs(host);
+          // Named host — use persistent ssh2 connection pool
+          ({ stdout, stderr } = await execSsh(host, command));
         } else {
+          // Raw IP/DNS — fall back to ssh CLI (no caching)
           if (!key) {
             throw new Error(
               `host '${host}' not found in hosts.json. Either use a known host (${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "none configured"}) or pass 'key' for raw IP/DNS access.`,
             );
           }
           const keyPath = resolveKeyPath(key);
-          sshArgs = ["-i", keyPath, ...SSH_BASE_OPTS, `${user}@${host}`];
+          const sshArgs = ["-i", keyPath, ...SSH_BASE_OPTS, `${user}@${host}`];
+          ({ stdout, stderr } = await execFileAsync(
+            "ssh",
+            [...sshArgs, command],
+            { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS, windowsHide: true },
+          ));
         }
-        const { stdout, stderr } = await execFileAsync(
-          "ssh",
-          [...sshArgs, command],
-          { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
-        );
         const parts = [];
         if (stdout) parts.push(stdout);
         if (stderr) parts.push(`--- stderr ---\n${stderr}`);
@@ -617,6 +890,226 @@ function createMcpServer() {
         return {
           content: [
             { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "sftp_download",
+    `Download a file from a remote host (over SFTP, reusing the persistent SSH pool) to the local filesystem where this MCP server is running. Streams the transfer — file size is not RAM-bound. Use this when working from Claude.ai web (the cloud sandbox has no access to the local disk) or when scp/rsync isn't a fit. Named hosts only — same pool as ssh_exec/postgres_query/pm2_status. Available hosts: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none - hosts.json not loaded)"}`,
+    {
+      host: z
+        .string()
+        .describe(
+          `host from hosts.json — available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none)"}`,
+        ),
+      remote_path: z
+        .string()
+        .min(1)
+        .describe(
+          "Absolute path on the remote host (e.g. '/home/ubuntu/backup.sql.gz' or '/var/log/nginx/access.log')",
+        ),
+      local_path: z
+        .string()
+        .min(1)
+        .describe(
+          "Absolute path on the local machine where the file will be written (e.g. 'D:/downloads/backup.sql.gz'). Parent directory is created if missing. Existing file is overwritten unless overwrite=false.",
+        ),
+      overwrite: z
+        .boolean()
+        .default(true)
+        .describe("If false, fail when local_path already exists. Default true."),
+    },
+    async ({ host, remote_path, local_path, overwrite }) => {
+      const t0 = Date.now();
+      try {
+        if (hasControlChar(local_path)) {
+          throw new Error(
+            "local_path contains control characters. Use forward slashes (D:/path/file) or escaped backslashes (D:\\\\path\\\\file) in JSON arguments.",
+          );
+        }
+
+        const resolvedLocal = path.resolve(local_path);
+
+        if (!overwrite) {
+          try {
+            await fs.access(resolvedLocal);
+            throw new Error(
+              `local_path exists and overwrite=false: ${resolvedLocal}`,
+            );
+          } catch (e) {
+            if (e.code !== "ENOENT") throw e;
+          }
+        }
+
+        await fs.mkdir(path.dirname(resolvedLocal), { recursive: true });
+
+        const bytes = await withSftp(host, (sftp) =>
+          new Promise((resolve, reject) => {
+            sftp.stat(remote_path, (statErr, attrs) => {
+              if (statErr) {
+                return reject(
+                  new Error(`remote file not accessible: ${statErr.message}`),
+                );
+              }
+              const expected = attrs.size;
+              const readStream = sftp.createReadStream(remote_path);
+              const writeStream = fsSync.createWriteStream(resolvedLocal);
+              let transferred = 0;
+              readStream.on("data", (chunk) => {
+                transferred += chunk.length;
+              });
+              readStream.on("error", reject);
+              writeStream.on("error", reject);
+              writeStream.on("finish", () => resolve({ transferred, expected }));
+              readStream.pipe(writeStream);
+            });
+          }),
+        );
+
+        const ms = Date.now() - t0;
+        const sizeMb = (bytes.transferred / 1024 / 1024).toFixed(2);
+        const rate = bytes.transferred / ms; // bytes/ms = KB/s
+        return {
+          content: [
+            {
+              type: "text",
+              text: `OK\nfrom: ${host}:${remote_path}\nto:   ${resolvedLocal}\nbytes: ${bytes.transferred}${bytes.expected !== bytes.transferred ? ` (expected ${bytes.expected})` : ""}\nsize: ${sizeMb} MB\nduration: ${ms}ms\nthroughput: ${rate.toFixed(0)} KB/s`,
+            },
+          ],
+        };
+      } catch (e) {
+        const ms = Date.now() - t0;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `ERROR: ${e.message}\nafter ${ms}ms\nfrom: ${host}:${remote_path}\nto:   ${local_path}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "sftp_upload",
+    `Upload a local file to a remote host (over SFTP, reusing the persistent SSH pool). Streams the transfer. Use when scp/rsync isn't available (Claude.ai web sandbox, no native shell). Named hosts only. Available hosts: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none - hosts.json not loaded)"}. NOTE: this writes as the SSH user (typically 'ubuntu'). For root-owned destinations, upload to /tmp first and move via ssh_exec + sudo.`,
+    {
+      host: z
+        .string()
+        .describe(
+          `host from hosts.json — available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(none)"}`,
+        ),
+      local_path: z
+        .string()
+        .min(1)
+        .describe(
+          "Absolute path on the local machine to read from (e.g. 'D:/projects/my-config.json')",
+        ),
+      remote_path: z
+        .string()
+        .min(1)
+        .describe(
+          "Absolute path on the remote host where the file will be written (e.g. '/home/ubuntu/uploads/config.json'). Parent directory must already exist — SFTP upload does not create intermediate dirs.",
+        ),
+      overwrite: z
+        .boolean()
+        .default(true)
+        .describe("If false, fail when remote_path already exists. Default true."),
+      mode: z
+        .string()
+        .regex(/^0?[0-7]{3,4}$/)
+        .optional()
+        .describe(
+          "Optional POSIX mode in octal (e.g. '0644', '0755'). If omitted, server default applies.",
+        ),
+    },
+    async ({ host, local_path, remote_path, overwrite, mode }) => {
+      const t0 = Date.now();
+      try {
+        if (hasControlChar(local_path)) {
+          throw new Error(
+            "local_path contains control characters. Use forward slashes (D:/path/file) or escaped backslashes in JSON.",
+          );
+        }
+        const resolvedLocal = path.resolve(local_path);
+        const localStat = await fs.stat(resolvedLocal).catch((e) => {
+          throw new Error(`local file not readable: ${e.message}`);
+        });
+        if (!localStat.isFile()) {
+          throw new Error(`local_path is not a regular file: ${resolvedLocal}`);
+        }
+        const expectedBytes = localStat.size;
+
+        const result = await withSftp(host, (sftp) =>
+          new Promise((resolve, reject) => {
+            const proceed = () => {
+              const readStream = fsSync.createReadStream(resolvedLocal);
+              const writeStream = sftp.createWriteStream(remote_path);
+              let transferred = 0;
+              readStream.on("data", (c) => (transferred += c.length));
+              readStream.on("error", reject);
+              writeStream.on("error", reject);
+              writeStream.on("close", () => {
+                if (mode) {
+                  const modeNum = parseInt(mode, 8);
+                  sftp.chmod(remote_path, modeNum, (chmodErr) => {
+                    if (chmodErr) {
+                      return reject(
+                        new Error(`upload ok but chmod failed: ${chmodErr.message}`),
+                      );
+                    }
+                    resolve({ transferred });
+                  });
+                } else {
+                  resolve({ transferred });
+                }
+              });
+              readStream.pipe(writeStream);
+            };
+
+            if (!overwrite) {
+              sftp.stat(remote_path, (statErr) => {
+                if (!statErr) {
+                  return reject(
+                    new Error(
+                      `remote_path exists and overwrite=false: ${remote_path}`,
+                    ),
+                  );
+                }
+                // ENOENT or similar — file does not exist, proceed
+                proceed();
+              });
+            } else {
+              proceed();
+            }
+          }),
+        );
+
+        const ms = Date.now() - t0;
+        const sizeMb = (result.transferred / 1024 / 1024).toFixed(2);
+        const rate = result.transferred / ms;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `OK\nfrom: ${resolvedLocal}\nto:   ${host}:${remote_path}\nbytes: ${result.transferred}${result.transferred !== expectedBytes ? ` (local stat said ${expectedBytes})` : ""}\nsize: ${sizeMb} MB\nduration: ${ms}ms\nthroughput: ${rate.toFixed(0)} KB/s${mode ? `\nmode: ${mode}` : ""}`,
+            },
+          ],
+        };
+      } catch (e) {
+        const ms = Date.now() - t0;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `ERROR: ${e.message}\nafter ${ms}ms\nfrom: ${local_path}\nto:   ${host}:${remote_path}`,
+            },
           ],
           isError: true,
         };
@@ -641,7 +1134,7 @@ function createMcpServer() {
       // in JSON (e.g. "D:\\tmp" -> literal TAB). Cmd.exe sometimes silently
       // normalizes (splits the path on TAB) producing surprising behavior; bash
       // never does. Reject early with the same diagnostic message.
-      if (/[\t\r\n\0\v\f]/.test(command)) {
+      if (hasControlChar(command)) {
         const codes = [...command]
           .slice(0, 60)
           .map((c) => c.charCodeAt(0).toString(16).padStart(2, "0"))
@@ -662,6 +1155,7 @@ function createMcpServer() {
           cwd: cwd || undefined,
           shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
           timeout: EXEC_TIMEOUT_MS,
+          windowsHide: true,
         });
         return {
           content: [{ type: "text", text: stdout || stderr || "(no output)" }],
@@ -698,7 +1192,7 @@ function createMcpServer() {
       // Detect JSON-escape disasters: TAB/CR/LF/NUL in path = client sent
       // `\t`, `\n`, `\r`, `\0` as single backslash instead of `\\t` etc.
       // mkdir would create or fail silently with garbage names. Reject early.
-      if (/[\t\r\n\0\v\f]/.test(filePath)) {
+      if (hasControlChar(filePath)) {
         const codes = [...filePath]
           .map((c) => c.charCodeAt(0).toString(16).padStart(2, "0"))
           .join(" ");
@@ -908,33 +1402,6 @@ function createMcpServer() {
     },
   );
 
-  function resolveKeyPath(keyName) {
-    const p = (HOSTS_CONFIG.keys || {})[keyName];
-    if (!p)
-      throw new Error(
-        `Unknown key '${keyName}'. Available: ${Object.keys(HOSTS_CONFIG.keys || {}).join(", ") || "(hosts.json not loaded)"}`,
-      );
-    // Cross-platform path normalization: tilde, forward slashes
-    let resolved = p;
-    if (resolved.startsWith("~/") || resolved.startsWith("~\\")) {
-      resolved = path.join(
-        process.env.HOME || process.env.USERPROFILE || "",
-        resolved.slice(2),
-      );
-    }
-    return path.normalize(resolved);
-  }
-
-  function buildSshArgs(hostKey) {
-    const h = (HOSTS_CONFIG.hosts || {})[hostKey];
-    if (!h)
-      throw new Error(
-        `Unknown host '${hostKey}'. Available: ${Object.keys(HOSTS_CONFIG.hosts || {}).join(", ") || "(hosts.json not loaded)"}`,
-      );
-    const user = h.user || "ubuntu";
-    return ["-i", resolveKeyPath(h.key), ...SSH_BASE_OPTS, `${user}@${h.ip}`];
-  }
-
   server.tool(
     "postgres_query",
     "Run a SQL query on a PostgreSQL database over SSH on a remote host from hosts.json. Uses psql via 'sudo -u postgres', so no password is needed (passwordless sudo required on the remote). SELECT returns data; DML/DDL also work - be careful on production databases. format='json' wraps SELECT/WITH queries with json_agg and returns a real JSON array.",
@@ -960,15 +1427,13 @@ function createMcpServer() {
         ),
     },
     async ({ host, database, query, format }) => {
+      let finalQuery = query;
       try {
-        await ensureSshAccess(host);
-        const sshArgs = buildSshArgs(host);
-        if (!/^[a-zA-Z0-9_]+$/.test(database)) {
+        if (!isValidDatabaseName(database)) {
           throw new Error(
             `Invalid database name: must match [a-zA-Z0-9_]+, got '${database}'`,
           );
         }
-        let finalQuery = query;
         let fmtFlag = "";
         if (format === "csv") {
           fmtFlag = "--csv";
@@ -985,11 +1450,7 @@ function createMcpServer() {
         // pass SQL via base64 -> stdin to avoid any shell quoting nightmares
         const sqlB64 = Buffer.from(finalQuery, "utf8").toString("base64");
         const remoteCmd = `cd /tmp && echo ${sqlB64} | base64 -d | sudo -u postgres psql -d ${database} ${fmtFlag}`;
-        const { stdout, stderr } = await execFileAsync(
-          "ssh",
-          [...sshArgs, remoteCmd],
-          { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
-        );
+        const { stdout, stderr } = await execSsh(host, remoteCmd);
         const parts = [];
         if (stdout) parts.push(stdout);
         if (stderr) parts.push(`--- stderr ---\n${stderr}`);
@@ -997,9 +1458,18 @@ function createMcpServer() {
           content: [{ type: "text", text: parts.join("\n") || "(no output)" }],
         };
       } catch (e) {
+        // Include the actual SQL (truncated) so the user can see what failed —
+        // base64-wrapped command in stderr is unreadable on its own.
+        const sqlPreview =
+          finalQuery.length > 1000
+            ? finalQuery.slice(0, 1000) + "\n... [truncated]"
+            : finalQuery;
         return {
           content: [
-            { type: "text", text: `ERROR: ${e.message}\n${e.stderr || ""}` },
+            {
+              type: "text",
+              text: `ERROR: ${e.message}\n${e.stderr || ""}\n--- SQL ---\n${sqlPreview}`,
+            },
           ],
           isError: true,
         };
@@ -1032,8 +1502,6 @@ function createMcpServer() {
     },
     async ({ host, app, lines }) => {
       try {
-        await ensureSshAccess(host);
-        const sshArgs = buildSshArgs(host);
         const buildRemote = (cmd) => {
           const script = [
             'export NVM_DIR="$HOME/.nvm"',
@@ -1053,11 +1521,7 @@ function createMcpServer() {
         }
         const outputs = [];
         for (const rc of remoteCmds) {
-          const { stdout, stderr } = await execFileAsync(
-            "ssh",
-            [...sshArgs, rc],
-            { maxBuffer: EXEC_BUFFER, timeout: EXEC_TIMEOUT_MS },
-          );
+          const { stdout, stderr } = await execSsh(host, rc);
           const partOut = [];
           if (stdout) partOut.push(stdout);
           if (stderr) partOut.push(`--- stderr ---\n${stderr}`);
@@ -1954,31 +2418,57 @@ app.post(
   },
 );
 
-const httpServer = app.listen(PORT, () =>
-  console.log(`MCP listening on :${PORT}`),
-);
+// MCP_TEST_MODE=true is set by vitest. In that mode we skip app.listen so the
+// test process can import this file as a module to get at its internal
+// helpers (resolveKeyPath, safeCompare, makeCsrf/verifyCsrf, getSshClient,
+// execSsh, withSftp) without binding to port 4500 or registering signal
+// handlers that would crash test shutdown.
+let httpServer = null;
+if (process.env.MCP_TEST_MODE !== "true") {
+  httpServer = app.listen(PORT, () =>
+    console.log(`MCP listening on :${PORT}`),
+  );
 
-async function shutdown(signal) {
-  console.log(`\n[${signal}] graceful shutdown...`);
-  httpServer.close(async () => {
-    // Flush pending state save
-    if (saveTimer) {
-      clearTimeout(saveTimer);
-      saveTimer = null;
-    }
-    try {
-      await flushState();
-    } catch (e) {
-      console.error(`[shutdown] state flush failed: ${e.message}`);
-    }
-    console.log("[shutdown] done");
-    process.exit(0);
-  });
-  // Force exit after 10s if connections hang
-  setTimeout(() => {
-    console.error("[shutdown] forced exit");
-    process.exit(1);
-  }, 10000).unref();
+  async function shutdown(signal) {
+    console.log(`\n[${signal}] graceful shutdown...`);
+    httpServer.close(async () => {
+      // Flush pending state save
+      if (saveTimer) {
+        clearTimeout(saveTimer);
+        saveTimer = null;
+      }
+      try {
+        await flushState();
+      } catch (e) {
+        console.error(`[shutdown] state flush failed: ${e.message}`);
+      }
+      console.log("[shutdown] done");
+      process.exit(0);
+    });
+    // Force exit after 10s if connections hang
+    setTimeout(() => {
+      console.error("[shutdown] forced exit");
+      process.exit(1);
+    }, 10000).unref();
+  }
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+
+// === Exports for vitest ===
+// Production server doesn't read these; test files import them directly.
+// Kept at module bottom so all definitions above are hoisted into scope.
+export {
+  resolveKeyPath,
+  buildSshArgs,
+  safeCompare,
+  makeCsrf,
+  verifyCsrf,
+  getSshClient,
+  execSsh,
+  withSftp,
+  closeAllSshPool,
+  SSH_POOL,
+  hasControlChar,
+  isValidDatabaseName,
+};

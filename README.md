@@ -76,6 +76,8 @@ This project is the **third option**: your own MCP server, your keys, your serve
 | `github_api`     | Make REST API requests to GitHub using your Personal Access Token                                                                                          |
 | `postgres_query` | Run `psql` queries via SSH (`sudo -u postgres`) on a host from `hosts.json`                                                                                |
 | `pm2_status`     | Show `pm2 list` and optional logs on a remote server                                                                                                       |
+| `sftp_download`  | Stream a file from a remote host to the local filesystem (uses the persistent SSH pool). Essential when working from Claude.ai web — the cloud sandbox has no native scp |
+| `sftp_upload`    | Stream a local file to a remote host. Optional POSIX mode flag (e.g. `0755`). Parent dir must exist on remote                                              |
 | `book_split`     | Split a large text file into ~3000-word chunks                                                                                                             |
 | `book_chunk`     | Read one chunk from a directory created by `book_split`                                                                                                    |
 | `book_note`      | Manage JSON notes for iterative work on long documents                                                                                                     |
