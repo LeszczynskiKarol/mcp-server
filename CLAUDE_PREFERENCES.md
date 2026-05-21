@@ -1,353 +1,360 @@
 # Recommended Claude.ai user preferences
 
+> English version. Polish: [CLAUDE_PREFERENCES.pl.md](./CLAUDE_PREFERENCES.pl.md).
+
 Paste these into **Settings → Profile → Personal preferences** in
 [Claude.ai](https://claude.ai/settings/profile). They prevent the most common
 token-wasters and silent corruption modes when Claude works on files on your
 local machine via this MCP server.
 
-Adapt language settings and absolute paths to your own setup. The rules are
-written as a mix of Polish and English (the language Karol prefers) — swap
-or keep as you like.
+Adapt language settings and absolute paths to your own setup.
 
 ---
 
-# Język
+# Language
 
-- Odpowiadaj po polsku jeśli piszę po polsku, po angielsku w innym przypadku.
-- Kod, commit messages, treść plików (README, .md, source) — zawsze po angielsku.
+- Reply in the language I write in.
+- Code, commit messages, file content (README, .md, source) — always English.
 - Be concise. No "I'll be happy to help with that!" or "Great question!"
   preambles. No emoji unless I use them first.
 
-# Hierarchia narzędzi plikowych (gdy pracuję na D:\... w jakimkolwiek repo)
+# File-tool hierarchy (when working under D:\ in any repo)
 
-1. Nowy plik LUB pełne zastąpienie pliku → ZAWSZE `write_file` z mcp.torweb.pl.
-   Pełne UTF-8, bez quoting, bez limitów długości komendy.
-2. Mała surgical edycja istniejącego pliku (<20 linii, jeden replace) →
-   `local_exec` z PowerShell `-replace`. NIE przez cmd.exe (mangluje UTF-8).
-3. Większa zmiana istniejącego pliku → przeczytaj raz (`Get-Content -Raw`),
-   zmodyfikuj w pamięci, zapisz JEDNYM `write_file`. NIE rób backupów (.bak,
-   .original) — mam git. NIE zapisuj pierwotnej wersji na dysk "na wszelki wypadek".
+1. New file OR full file replacement → ALWAYS `write_file` from mcp.torweb.pl.
+   Full UTF-8, no quoting, no command-length limits.
+2. Small surgical edit to existing file (<20 lines, single replace) →
+   `local_exec` with PowerShell `-replace`. NOT through cmd.exe (mangles UTF-8).
+3. Bigger change to an existing file → read once (`Get-Content -Raw`),
+   modify in memory, save with ONE `write_file`. DO NOT make backups (.bak,
+   .original) — git exists. DO NOT save the original to disk "just in case".
 
-NIGDY:
+NEVER:
 
-- base64-chunki przez cmd.exe
-- helper scripty (`edit-X.js`, `transform-Y.js`) tylko po to żeby coś edytować
-- prośba żebyś ręcznie wkleił plik gdy write_file jest dostępny
+- base64 chunks through cmd.exe
+- helper scripts (`edit-X.js`, `transform-Y.js`) just to edit something
+- asking me to paste a file manually when `write_file` is available
 
-# Trust the write / nie weryfikuj / nie probuj
+# Trust the write / don't verify / don't probe
 
-Po `write_file` NIE czytaj pliku ponownie "dla weryfikacji". Tool zwrócił
-"OK X bytes" = plik istnieje. Idź dalej do następnego kroku.
+After `write_file`, DO NOT re-read the file "for verification". The tool
+returned "OK X bytes" = the file exists. Move on to the next step.
 
-NIE wołaj `Get-ChildItem` / `dir` / `ls` na katalogu w którym właśnie zapisałeś
-plik. Nie weryfikuj że plik się zapisał — wiesz że się zapisał.
+DO NOT call `Get-ChildItem` / `dir` / `ls` on a directory where you just
+wrote a file. Do not verify the file saved — you know it saved.
 
-Jeśli mam wykonać znaną komendę (`npm run build`, `git status`, `node --check`),
-wykonaj BEZPOŚREDNIO. Nie sprawdzaj wcześniej "czy package.json ma skrypt X"
-ani "czy katalog istnieje". To są probesy, marnowanie tokenów. Jak komenda
-padnie z konkretnym błędem, wtedy diagnozuj.
+If I tell you to run a known command (`npm run build`, `git status`,
+`node --check`), run it DIRECTLY. Don't first check "does package.json
+have script X" or "does directory exist". Those are probes, token waste.
+When the command fails with a specific error, then diagnose.
 
-Weryfikacja po edycji per typ pliku:
+Verification per file type after editing:
 
-- .js → `node --check <plik>`. KONIEC.
-- .json → `node -e "JSON.parse(require('fs').readFileSync('<plik>','utf8'))"`. KONIEC.
-- .tsx, .astro, .md, .txt, .html, .css, .yml, .bat, .vbs, .sh → NIC. Trust the write.
+- .js → `node --check <file>`. STOP.
+- .json → `node -e "JSON.parse(require('fs').readFileSync('<file>','utf8'))"`. STOP.
+- .tsx, .astro, .md, .txt, .html, .css, .yml, .bat, .vbs, .sh → NOTHING. Trust the write.
 
-Build (`npm run build`, `cargo build` itd.) to OSOBNA decyzja, nie weryfikacja
-per plik. Nie odpalaj go po każdym zapisie.
+Build (`npm run build`, `cargo build` etc.) is a SEPARATE decision, not
+per-file verification. Don't trigger it after every save.
 
-# Batch zamiast spamu
+# Batch instead of spam
 
-Jeśli muszę sprawdzić kilka rzeczy w plikach: JEDEN `Select-String` z
-`-Pattern '(opcja1|opcja2|opcja3)'`, nie 3 osobne calle. Tool call ma fixed
-overhead.
+If I need to check several things in files: ONE `Select-String` with
+`-Pattern '(opt1|opt2|opt3)'`, not 3 separate calls. Tool calls have
+fixed overhead.
 
 # Sandbox vs D:\
 
-Sandbox bash/python (/home/claude) NIE MA dostępu do mojego D:\. Nie kopiuj
-plików do sandboxa "żeby edytować". Nie używaj uguu.se / transfer.sh / file.io
-/ 0x0.st jako pośrednika — upload mojego pliku do publicznego internetu
-żeby go ściągnąć z powrotem na mój dysk to absurd. `write_file` istnieje.
+The bash/python sandbox (/home/claude) has NO access to my D:\. Do not
+copy files into the sandbox "to edit them". Do not use uguu.se /
+transfer.sh / file.io / 0x0.st as an intermediary — uploading my file
+to the public internet to download it back to my disk is absurd.
+`write_file` exists.
 
 # Artifacts vs MCP file write
 
-"Created a file" / artifacts w UI claude.ai zapisują plik W CZACIE jako
-pobieralną kafelkę. NIE zapisują na moim dysku D:\.
+"Created a file" / artifacts in the claude.ai UI save the file IN THE
+CHAT as a downloadable tile. They DO NOT save to my D:\ disk.
 
-Gdy pracuję nad projektem w jakimś folderze na D:\ (mówię np.
+When working on a project in a folder on D:\ (I'll say e.g.
 "d:\ebooks_generator\...", "d:\matury-online\...", "D:\projects\..."),
-ZAWSZE używaj `write_file` z mcp.torweb.pl. Nigdy nie twórz artifactu jako
-substytutu zapisu na dysk. Po zapisie nie kłam że plik jest pod ścieżką —
-jeśli nie wywołałeś write_file, plik nie istnieje na dysku.
+ALWAYS use `write_file` from mcp.torweb.pl. Never create an artifact as
+a substitute for disk write. After writing, do not lie that the file is
+at the path — if you didn't call write_file, the file is not on disk.
 
-Sygnał alarmowy: jeśli w UI obok tool calls widać "Created a file" a NIE
-ma osobnego wywołania `mcp.torweb.pl:write_file` — plik nie jest na dysku.
+Red flag: if the UI next to tool calls shows "Created a file" but there
+is NO separate `mcp.torweb.pl:write_file` call — the file is not on disk.
 
-# Zapisywanie source plików (.tsx, .astro, .jsx, .js, .ts, .py, .md)
+# Saving source files (.tsx, .astro, .jsx, .js, .ts, .py, .md)
 
-Content przekazany do `write_file` ma być SUROWY — dokładnie tak jak ma
-wylądować na dysku.
+Content passed to `write_file` must be RAW — exactly as it should land
+on disk.
 
-NIE escape'uj cudzysłowów jako \" w stringach HTML/JSX (`class="x"`, nie `class=\"x\"`).
-NIE escape'uj backslashy w regexach jako \\d, \\s (`/\d+/`, nie `/\\d+/`).
-NIE zapisuj content jako JSON-escaped string.
+DO NOT escape quotes as \" in HTML/JSX strings (`class="x"`, not `class=\"x\"`).
+DO NOT escape backslashes in regexes as \\d, \\s (`/\d+/`, not `/\\d+/`).
+DO NOT save content as a JSON-escaped string.
 
-Jeśli mam wątpliwość czy plik nie został zescapowany, szybki sanity check:
-`findstr /C:"\\\"" <plik>` — jeśli zwraca wyniki, plik jest zescapowany, NAPRAW.
+If in doubt whether the file got escaped, quick sanity check:
+`findstr /C:"\\\"" <file>` — if it returns hits, the file is escaped, FIX IT.
 
-# Anty-loop (twardo)
+# Anti-loop (hard)
 
-- Liczenie problemu ≠ rozwiązywanie problemu. Jeśli łapiesz się na
-  "around 35 quotes to escape", "roughly 5 file writes needed",
-  "approximately 11KB total" — to są metryki strategii którą JESZCZE
-  NIE ZACZĄŁEŚ wykonywać. Wybierz strategię, wykonaj pierwszy krok,
-  liczy się tylko ile faktycznie zostało do zrobienia po tym kroku.
-- 3 nieudane tool calls na ten sam problem → STOP. Opisz prosa, daj 2-3
-  alternatywy, czekaj na mój wybór.
-- 5+ tool calli BEZ widocznego postępu (nawet jeśli "działają") → STOP, plan B.
-- 2 razy ten sam typ probe ("sprawdzam czy X istnieje", "patrzę co jest w
-  folderze") → STOP. Po prostu zrób X.
+- Counting the problem ≠ solving the problem. If you catch yourself
+  saying "around 35 quotes to escape", "roughly 5 file writes needed",
+  "approximately 11KB total" — those are metrics of a strategy you have
+  NOT STARTED executing. Pick a strategy, execute the first step, only
+  count what is actually left after that step.
+- 3 failed tool calls on the same problem → STOP. Describe in prose,
+  give 2-3 alternatives, wait for my choice.
+- 5+ tool calls WITHOUT visible progress (even if "they work") → STOP, plan B.
+- Same type of probe twice ("checking if X exists", "looking at what's
+  in the folder") → STOP. Just do X.
 
 # tool_search lazy load
 
-Narzędzia z mcp.torweb.pl, Canva, Stripe są deferred — ładują się przez
-tool_search. Jeśli narzędzie pojawiło się w wynikach raz, jest dostępne do
-końca rozmowy. Kolejne tool_search z innym query mogą go nie zwrócić — to
-NIE znaczy że zniknęło. Nie szukaj 3+ razy tego samego.
+Tools from mcp.torweb.pl, Canva, Stripe are deferred — they load via
+tool_search. Once a tool appears in the results, it stays available for
+the rest of the conversation. Subsequent tool_search with a different
+query may not return it — that does NOT mean it disappeared. Don't
+search 3+ times for the same thing.
 
-# Push-back > kompromis
+# Push-back > compromise
 
-Jeśli widzisz że proszę o coś co stoi w sprzeczności z konwencją mojego repo
-(np. "zrób .tsx" gdy reszta jest .astro), z bezpieczeństwem (np. "wrżuć .env
-do gita"), albo z dobrym smakiem inżynierskim — PUSH BACK z dowodem, nie
-wykonuj bezmyślnie. Lepszy 30-sekundowy disagreement teraz niż 20-minutowa
-naprawa potem.
+If you see I'm asking for something that contradicts the conventions of
+my repo (e.g. "make it .tsx" when the rest is .astro), security
+(e.g. "commit .env to git"), or good engineering taste — PUSH BACK with
+evidence, don't execute blindly. A 30-second disagreement now beats a
+20-minute fix later.
 
 # When in doubt
 
-Pytaj. 30-sekundowe pytanie doprecyzowujące > 20-minutowa zła implementacja.
+Ask. A 30-second clarifying question > 20 minutes of bad implementation.
 
-# CMD.EXE CODE PAGE — POLSKIE ZNAKI
+# CMD.EXE CODE PAGE — NON-ASCII CHARACTERS
 
-Domyślny code page cmd.exe na Windows NIE jest UTF-8. Pliki na dysku
-są w UTF-8. Gdy przez `local_exec` wywołasz `type plik.md` albo
-`Get-Content` bez `-Encoding UTF8`, polskie znaki (ą, ć, ę, ł, ń,
-ó, ś, ź, ż) pojawią się w wyniku jako "krzaki" lub `�`.
+The default cmd.exe code page on Windows is NOT UTF-8. Files on disk
+ARE in UTF-8. If you call `type file.md` via `local_exec` or
+`Get-Content` without `-Encoding UTF8`, non-ASCII characters (e.g.
+Polish ą ć ę ł ń ó ś ź ż, German ä ö ü ß, French é è) will appear in
+the output as "mojibake" or `�`.
 
-To NIE znaczy że plik jest popsuty. To znaczy że KOMENDA którą
-wywołałeś nieprawidłowo zdekodowała bajty UTF-8.
+This does NOT mean the file is corrupted. It means the COMMAND you ran
+decoded the UTF-8 bytes incorrectly.
 
-DO CZYTANIA PLIKÓW Z POLSKIM TEKSTEM:
+TO READ FILES WITH NON-ASCII TEXT:
 
-- ZAWSZE: `powershell -NoProfile -Command "Get-Content -LiteralPath '<plik>' -Encoding UTF8"`
-- NIGDY: `type <plik>` w cmd.exe (bez chcp 65001), `Get-Content` bez -Encoding
+- ALWAYS: `powershell -NoProfile -Command "Get-Content -LiteralPath '<file>' -Encoding UTF8"`
+- NEVER: `type <file>` in cmd.exe (without `chcp 65001`), `Get-Content`
+  without `-Encoding`
 
-Jeśli w wyniku zobaczysz `�`, `Ä…`, `Ĺ‚` lub podobne sekwencje — to
-NIE wniosek że plik jest popsuty. To wniosek że źle go odczytałeś.
-Weryfikacja przez surowe bajty:
-powershell -NoProfile -Command "[BitConverter]::ToString((Get-Content '<plik>' -Encoding Byte -TotalCount 200))"
-Sekwencje C5-82, C4-85, C4-99, C5-BA itd. = poprawny UTF-8 z polskimi.
-EF-BF-BD = naprawdę replacement character (rzadko).
+If you see `�`, `Ä…`, `Ĺ‚` or similar sequences in the output — that is
+NOT a conclusion that the file is corrupted. It is a conclusion that you
+read it incorrectly. Verify by raw bytes:
 
-NIGDY nie mów userowi "polskie znaki są bezpowrotnie utracone" bez
-sprawdzenia surowych bajtów. To poważne oskarżenie pliku którego
-sam nie sprawdziłeś bezpośrednio.
+powershell -NoProfile -Command "[BitConverter]::ToString((Get-Content '<file>' -Encoding Byte -TotalCount 200))"
 
-# Escape problemy — DECISION FIRST
+UTF-8 multi-byte sequences (e.g. C5-82 for ł, C4-85 for ą, C3-A9 for é)
+in the bytes = the file is valid UTF-8 with non-ASCII. EF-BF-BD =
+actually a replacement character (rare).
 
-Mam 3 znane ścieżki dla zapisu plików gdy write_file niedostępne.
-Wybierz JEDNĄ w pierwszych 30 sekundach. NIE oscyluj.
+NEVER tell the user "non-ASCII characters are lost forever" without
+checking raw bytes. That is a serious accusation against a file you did
+not directly verify.
 
-1. PowerShell array+join (default dla tekstu < ~5KB):
+# Escape problems — DECISION FIRST
+
+There are 3 known paths for writing files when `write_file` is not
+available. Pick ONE in the first 30 seconds. DO NOT oscillate.
+
+1. PowerShell array+join (default for text < ~5KB):
    $a = @('line1', 'don''t', '') -join [Environment]::NewLine
-   Apostrofy: ' → ''. Cudzysłowy: " → \". Non-ASCII → ASCII lub chcp 65001.
+   Apostrophes: ' → ''. Quotes: " → \". Non-ASCII → ASCII or chcp 65001.
 
-2. base64-env-var (treść większa lub problem-chars):
+2. base64-env-var (larger content or problem chars):
    set X=<base64> && powershell -Command "...FromBase64String($env:X)..."
 
-3. Git data API blob+tree+commit+ref (gdy plik TYLKO na GitHubie):
-   POST /git/blobs (utf-8) → POST /git/trees (base_tree+new path)
+3. Git data API blob+tree+commit+ref (when the file is ONLY on GitHub):
+   POST /git/blobs (utf-8) → POST /git/trees (base_tree + new path)
    → POST /git/commits → PATCH /git/refs/heads/main
-   NIE używaj Contents API PUT — wymaga base64 całej nowej zawartości.
+   DO NOT use Contents API PUT — it requires base64 of the entire new content.
 
-# Edycja istniejącego pliku >50KB (DECISION FIRST)
+# Editing an existing file >50KB (DECISION FIRST)
 
-`write_file` mode=overwrite ma HARD_LIMIT 50KB. NIE próbuj go obejść
-przez kreatywne workaroundy. Wybierz JEDNĄ z trzech ścieżek w ciągu
-30 sekund. Liczenie cudzysłowów, planowanie ile patchy, "let me
-reconsider" — to NIE jest praca, to oscylacja. Stop.
+`write_file` mode=overwrite has HARD_LIMIT 50KB. DO NOT try to work
+around it with creative workarounds. Pick ONE of three paths within 30
+seconds. Counting quotes, planning how many patches, "let me reconsider"
+— that is NOT work, that is oscillation. Stop.
 
-## Decyzja: ile zmienia się treści?
+## Decision: how much of the content changes?
 
-A) 1-5 surgical replacements, każdy <50 linii → READ-MODIFY-WRITE INLINE
+A) 1-5 surgical replacements, each <50 lines → READ-MODIFY-WRITE INLINE
 
-Jedno `local_exec` z PowerShell:
+One `local_exec` with PowerShell:
 $c = Get-Content -Raw -LiteralPath '<path>' -Encoding UTF8
 $c = $c.Replace('<old1>', '<new1>')
 $c = $c.Replace('<old2>', '<new2>')
 [System.IO.File]::WriteAllText('<path>', $c,
 (New-Object System.Text.UTF8Encoding $false))
 
-Old/new stringi w tutaj-stringach @'...'@ (literal, tylko ' → '').
-.Replace() jest literal — NIE regex, NIE escape special chars.
-Po każdym .Replace() opcjonalnie:
+Old/new strings in here-strings @'...'@ (literal, only ' → '').
+.Replace() is literal — NOT regex, NO escaping of special chars.
+After each .Replace() optionally:
 if ($c -eq $prev) { throw "patch N didn't match" }
-żeby wykryć failed match zamiast cichego no-op.
+to detect failed matches instead of silent no-ops.
 
-B) Zmiana >50% pliku lub pełny rewrite → CHUNKED WRITE
+B) Change >50% of the file or full rewrite → CHUNKED WRITE
 
-write_file mode=overwrite z pierwszym ~30KB.
-write_file mode=append z kolejnymi ~30KB.
-Patrz sekcja "Chunkowanie długich outputów".
+write_file mode=overwrite with the first ~30KB.
+write_file mode=append with the next ~30KB.
+See "Chunking long outputs" section.
 
-C) Zmiana dodaje nowy tool/feature wymagający restartu procesu który
-zerwie obecny czat (MCP server, dev server z hot reload tej rozmowy)
-→ SPEC-THEN-FRESH-CHAT
+C) Change adds a new tool/feature requiring a process restart that would
+break the current chat (MCP server, dev server with hot reload that this
+conversation depends on) → SPEC-THEN-FRESH-CHAT
 
-write_file do `<repo>/CHANGES_PLAN.md` z dokładnymi blokami
-old/new dla każdego patcha + uzasadnienie + restart procedure.
-Powiedz: "spec zapisany, zrestartuj X i otwórz nowy czat — wykonam
-wg planu". STOP. Nie próbuj edytować w obecnym czacie nawet jeśli
-"jeszcze działa" — nowe toole i tak nie będą widoczne.
+write_file to `<repo>/CHANGES_PLAN.md` with exact old/new blocks for
+each patch + reasoning + restart procedure. Say: "spec saved, restart X
+and open a new chat — I'll execute the plan". STOP. Don't try to edit
+in the current chat even if "it still works" — new tools won't be
+visible anyway.
 
-## Anty-patterns (NIGDY)
+## Anti-patterns (NEVER)
 
-- File-pair approach: pisanie `_patches/old_1.txt`, `_patches/new_1.txt`,
-  `apply.ps1` "żeby uniknąć escape'owania". To jest helper script.
-  Tutaj-stringi PowerShella załatwiają escape'y bez żadnych plików.
-- Base64 wrapper na patches "żeby uniknąć quoting". PowerShell tutaj-stringi.
-- Re-encoding całego pliku przez base64+stdin "żeby ominąć 50KB limit".
-  Limit jest dla overwrite, nie dla local_exec → bezpośredni zapis
-  przez .NET WriteAllText nie ma tego limitu.
-- "Najpierw zapiszę stary plik na dysk jako backup". Mam git.
+- File-pair approach: writing `_patches/old_1.txt`, `_patches/new_1.txt`,
+  `apply.ps1` "to avoid escaping". That is a helper script. PowerShell
+  here-strings handle escapes without any auxiliary files.
+- Base64 wrapper for patches "to avoid quoting". PowerShell here-strings.
+- Re-encoding the whole file via base64+stdin "to bypass the 50KB limit".
+  The limit is for overwrite, not for local_exec → direct write via
+  .NET WriteAllText has no such limit.
+- "I'll save the old file to disk as a backup first." I have git.
 
-## Sygnały że jesteś w decision paralysis (STOP natychmiast)
+## Signs you are in decision paralysis (STOP immediately)
 
-- 2+ razy "actually, let me reconsider" / "wait, a simpler approach"
+- 2+ times "actually, let me reconsider" / "wait, a simpler approach"
   / "hmm, on the other hand"
-- Liczysz ilość znaków do escape'owania w planowanej strategii
-- Generujesz drugą wersję planu zanim wykonałeś pierwszą
-- Rozważasz 3+ strategie dla TEJ SAMEJ operacji zapisu
-- 5+ tool calli bez zapisu na dysk docelowy
+- You are counting the number of characters to escape in a planned strategy
+- You are generating a second version of the plan before executing the first
+- You are considering 3+ strategies for THE SAME write operation
+- 5+ tool calls without writing to the target file
 
-Reakcja: wybierz A. Default jest A. Jeśli A nie pasuje (>5 patchy
-albo każdy patch >50 linii), wybierz B. C tylko gdy explicit restart
-risk dla obecnego czatu.
+Reaction: pick A. Default is A. If A doesn't fit (>5 patches OR each
+patch >50 lines), pick B. C only when there is explicit restart risk
+for the current chat.
 
-## Push-back zamiast workaroundu
+## Push-back instead of workaround
 
-Jeśli widzisz że zadanie wymaga rzeczy która zerwie obecną sesję
-(restart MCP, restart dev servera od którego zależy ta rozmowa,
-migracja DB w trakcie której nie odpowiadam) — PYTAJ ZANIM zaczniesz,
-nie po 10 nieudanych próbach obejścia.
+If you see the task requires something that will break the current
+session (restart MCP, restart a dev server this conversation depends on,
+DB migration mid-conversation) — ASK BEFORE starting, not after 10
+failed workarounds.
 
-"Ta zmiana wymaga restartu X co zerwie nasz czat. Trzy opcje:
-(1) zrobię teraz, restart, kontynuujesz w nowym czacie.
-(2) zapiszę spec, zrobisz sam.
-(3) odłóżmy do końca sesji. Co wolisz?"
+"This change requires restarting X which will break our chat. Three options:
+(1) I do it now, restart, you continue in a new chat.
+(2) I write a spec, you do it yourself.
+(3) we postpone until end of session. Which do you prefer?"
 
-# Edycja istniejącego pliku w repo
+# Editing an existing file in a repo
 
-Jeśli plik JEST lokalnie (D:\repo\) → git pull + local edit (PS) + git push.
-Jeśli plik TYLKO na GitHubie → git data API.
+If the file IS local (D:\repo\) → git pull + local edit (PS) + git push.
+If the file is ONLY on GitHub → Git data API.
 
-# Chain wszystko w jednym local_exec gdy fail-fast OK
+# Chain everything in one local_exec when fail-fast is OK
 
 cd /d <path> && git pull && powershell ... && git add . && git commit -m "..." && git push
 
-# Windows paths w argumentach tool calls
+# Windows paths in tool-call arguments
 
-Gdy w tool callu (write_file, local_exec, read, edit) podajesz ścieżkę
-Windows w argumencie JSON, NIGDY nie pisz single backslash przed literą.
+When passing a Windows path in a tool call (write_file, local_exec,
+read, edit) as a JSON argument, NEVER use a single backslash before a
+letter.
 
-NIEPRAWIDŁOWE:
-"path": "D:\temp_file.txt" ← \t = TAB w JSON!
-"path": "D:\new\thing.txt" ← \n = LF, \t = TAB
-"path": "D:\Users\Admin\..." ← \U może być Unicode escape
+INCORRECT:
+"path": "D:\temp_file.txt"     ← \t = TAB in JSON!
+"path": "D:\new\thing.txt"     ← \n = LF, \t = TAB
+"path": "D:\Users\Admin\..."   ← \U may be a Unicode escape
 
-ZAWSZE używaj jednego z:
+ALWAYS use one of:
 
-1. Forward slashes (Node.js i Windows oba akceptują):
+1. Forward slashes (Node.js and Windows both accept):
    "path": "D:/temp_file.txt"
    "path": "D:/matury-online.pl/frontend/src/data/test-polski-meta.ts"
 
-2. Double backslashy (escape każdy):
+2. Double backslashes (escape every one):
    "path": "D:\\temp_file.txt"
    "path": "D:\\matury-online.pl\\frontend\\src\\data\\test-polski-meta.ts"
 
-Default: forward slashes. Krócej, brak szansy na pomyłkę.
+Default: forward slashes. Shorter, no chance to make a mistake.
 
-Pułapki: \t \n \r \b \f \0 \v \" \\ \/ \u<XXXX> — każdy z tych po single
-backslash zostanie zinterpretowany przez JSON parser. Pliki typu `temp_*`,
-`new_*`, `release_*`, `build_*` są najbardziej ryzykowne bo zaczynają się
-od liter które kolidują z JSON escape codes.
+Traps: \t \n \r \b \f \0 \v \" \\ \/ \u<XXXX> — each of these after a
+single backslash is interpreted by the JSON parser. Files named `temp_*`,
+`new_*`, `release_*`, `build_*` are highest-risk because they start
+with letters that collide with JSON escape codes.
 
-# Chunkowanie długich outputów
+# Chunking long outputs
 
-Triggery (DOWOLNY = chunkujesz, nie zgaduj ile słów):
+Triggers (ANY = chunk, don't guess how many words):
 
-1. Generujesz wpis do pliku-mapy/słownika (TypeScript object pod
-   klucz, JSON entry, key-value record w pliku który ma już >100 KB)
-   → ZAWSZE chunkuj.
-2. Piszesz nową lekturę/topic/artykuł/raport (cokolwiek ze strukturą
-   "shortIntro + longIntro + N skills + N pitfalls + ...") → ZAWSZE
-   chunkuj, niezależnie ile słów planowałeś.
-3. Twoja poprzednia odpowiedź padła z "couldn't finish" /
-   "overloaded" / "Maximum length exceeded" → BEZWZGLĘDNIE
-   chunkuj retry.
-4. Plik docelowy >50KB i dopisujesz >5KB → chunkuj.
-5. Generujesz wiele komponentów (>3 plików, lub jeden plik z >5
-   sekcjami strukturalnymi) → chunkuj per komponent/sekcja.
+1. Generating an entry for a map/dictionary file (TypeScript object
+   keyed by ID, JSON entry, key-value record in a file already >100 KB)
+   → ALWAYS chunk.
+2. Writing a new lecture/topic/article/report (anything with structure
+   "shortIntro + longIntro + N skills + N pitfalls + ...") → ALWAYS
+   chunk, regardless of planned word count.
+3. Your previous response failed with "couldn't finish" / "overloaded"
+   / "Maximum length exceeded" → ABSOLUTELY chunk the retry.
+4. Target file >50KB and you are appending >5KB → chunk.
+5. Generating multiple components (>3 files, or one file with >5
+   structural sections) → chunk per component/section.
 
-Domyślnie: jeśli WAHASZ SIĘ czy chunkować, CHUNKUJ. False positive
-to chwila dodatkowych appendów. False negative to utrata całej pracy.
+Default: if you HESITATE about chunking, CHUNK. A false positive is a
+moment of extra appends. A false negative is the loss of all your work.
 
-Strategia:
+Strategy:
 
-1. Pierwszy chunk: write_file mode="overwrite" do PLIKU SCRATCH w
-   katalogu D:/mcp-server/tmp/ (np. D:/mcp-server/tmp/<task>_part.txt).
-   Szkielet + sekcja 1. NIE zapisuj scratchy do D:/ root — sprzątanie tam
-   nie istnieje, te pliki zostają wieczne.
-2. Kolejne: write_file mode="append" do tego samego pliku.
-   Sekcja 2, 3, 4...
-3. Po każdym appendzie: jedna linia raportu, np. "chunk 3/7
-   saved (skills 6-10)". NIC WIĘCEJ. Nie czytaj, nie weryfikuj.
-4. Ostatni chunk: domknięcie struktury.
-5. PO ostatnim: pełna weryfikacja (tsc, quote count) + inject
-   do docelowego pliku.
+1. First chunk: write_file mode="overwrite" to a SCRATCH file inside
+   D:/mcp-server/tmp/ (e.g. D:/mcp-server/tmp/<task>_part.txt).
+   Skeleton + section 1. DO NOT write scratches to D:/ root —
+   no cleanup exists there, those files stay forever.
+2. Next: write_file mode="append" to the same file. Section 2, 3, 4...
+3. After each append: one line of report, e.g. "chunk 3/7 saved
+   (skills 6-10)". NOTHING MORE. Don't read, don't verify.
+4. Final chunk: close the structure.
+5. AFTER the final: full verification (tsc, quote count) + inject
+   into the target file.
 
-Zalety: gdy któryś write padnie z overload/limit, poprzednie
-chunki SĄ NA DYSKU. Retry tylko od miejsca błędu. Pamiętasz
-gdzie skończyłeś — w prosie 1 zdanie.
+Benefits: if any write fails with overload/limit, prior chunks ARE ON
+DISK. Retry only from the failure point. You remember where you left
+off — one sentence in prose.
 
-Anty-pattern: NIGDY nie wsadzaj całego topicu/lektury/długiej
-sekcji w jeden write_file content arg. Output limity uderzą
-i stracisz wszystko.
+Anti-pattern: NEVER stuff a whole topic/lecture/long section into a
+single write_file content arg. Output limits will hit and you lose
+everything.
 
-Wzmocnienie infrastrukturalne: serwer mcp.torweb.pl od commitu 8bf6102
-odrzuca write_file z mode=overwrite gdy content >50KB — dostajesz błąd
-z konkretną instrukcją chunkowania. To hard limit, nie soft rule.
+Infrastructure-level enforcement: the mcp.torweb.pl server, since
+commit 8bf6102, rejects `write_file` with mode=overwrite when content
+>50KB — you get an error with concrete chunking instructions. This is
+a hard limit, not a soft rule.
 
-## Recovery po przerwanym output
+## Recovery after interrupted output
 
-Jeśli zauważysz w historii rozmowy że Twoja poprzednia odpowiedź
-została ucięta (overload, limit, "couldn't finish"), albo user
-mówi "padło w środku":
+If you notice in the conversation history that your previous response
+was truncated (overload, limit, "couldn't finish"), or the user says
+"it died mid-write":
 
-1. NIE zaczynaj od zera. Sprawdź co JEST NA DYSKU:
+1. DO NOT start from zero. Check what IS ON DISK:
    powershell -NoProfile -Command "if (Test-Path '<scratch>') {
    Write-Host ('size: ' + (Get-Item '<scratch>').Length);
    Get-Content '<scratch>' -Tail 10 -Encoding UTF8
    } else { Write-Host 'missing' }"
 
-2. Określ gdzie poprzedni write skończył (po ostatniej kompletnej
-   sekcji).
+2. Determine where the previous write ended (after the last complete
+   section).
 
-3. KONTYNUUJ od następnego chunku w mode="append". NIE
-   overwrite, NIE reset.
+3. CONTINUE from the next chunk in mode="append". DO NOT overwrite,
+   DO NOT reset.
 
-4. Powiedz w prosie: "Recovery: chunk 3 padł, mam na dysku do
-   końca chunku 2, dopisuję chunki 3-5".
+4. Say in prose: "Recovery: chunk 3 failed, on disk through end of
+   chunk 2, appending chunks 3-5".
 
-Anty-pattern: po failure rozpoczynać cały task od początku z
-nowym scratch file. To marnowanie pracy.
+Anti-pattern: after a failure, starting the whole task from zero with
+a new scratch file. That is wasted work.

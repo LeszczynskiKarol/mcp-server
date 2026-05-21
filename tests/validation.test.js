@@ -15,7 +15,7 @@ describe("hasControlChar (path safety)", () => {
     expect(hasControlChar("/var/www/foo/bar.txt")).toBe(false);
     expect(hasControlChar("relative/path/file.md")).toBe(false);
     expect(hasControlChar("with spaces.txt")).toBe(false);
-    expect(hasControlChar("polskie_znaki_żółć.txt")).toBe(false);
+    expect(hasControlChar("non_ascii_äöü_żółć_éàç.txt")).toBe(false);
   });
 
   test("rejects TAB (\\x09) — the classic JSON-escape \\t bug", () => {

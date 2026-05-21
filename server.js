@@ -1623,7 +1623,8 @@ function createMcpServer() {
 
         // Sentence terminator followed by optional closing punctuation (straight
         // and curly quotes, guillemets, right brackets) and end-of-line.
-        // Catches: . ! ? … ." ?» !) …" — common in Polish/dialog texts.
+        // Catches: . ! ? ... ." ?>> !) ..." -- common across natural-language
+        // and dialog-heavy texts.
         const SENTENCE_END =
           /[.!?\u2026][\s"'\u201D\u2019\u00BB\u203A)\]]*\s*$/;
 

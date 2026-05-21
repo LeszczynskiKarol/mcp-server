@@ -82,8 +82,8 @@ at `D:\` root with no cleanup story.
 
 After editing, run exactly this and nothing more:
 
-- `.js` → `node --check <plik>`. STOP.
-- `.json` → `node -e "JSON.parse(require('fs').readFileSync('<plik>','utf8'))"`. STOP.
+- `.js` → `node --check <file>`. STOP.
+- `.json` → `node -e "JSON.parse(require('fs').readFileSync('<file>','utf8'))"`. STOP.
 - `.md`, `.txt`, `.bat`, `.vbs`, `.sh`, `.yml`, `.ps1` → no verification. Trust the write.
 
 Do NOT re-read the file to "make sure it saved". `write_file` returned bytes =
