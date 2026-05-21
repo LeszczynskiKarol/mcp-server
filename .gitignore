@@ -27,6 +27,9 @@ npm-debug.log*
 *.tmp
 .tmp_*
 
+# Scratch directory for Claude / MCP — pruned by cleanup-tmp.ps1
+tmp/
+
 # PM2 (legacy — not used since switch to Task Scheduler)
 dump.pm2
 .pm2/
