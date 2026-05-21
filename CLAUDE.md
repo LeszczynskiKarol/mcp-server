@@ -25,6 +25,21 @@ This file adds context specific to `mcp-server`.
 - `watchdog.ps1` — runs every 2 minutes via Task Scheduler "MCP Server
   Watchdog", respawns the server if both the node.exe AND its start-mcp.bat
   loop are dead. Logs to `logs/watchdog.log`.
+- `tmp/` — gitignored, designated scratch directory. Anything written here
+  is treated as disposable and gets pruned by `cleanup-tmp.ps1` (see Scratch
+  files convention below).
+- `cleanup-tmp.ps1` — Task Scheduler "MCP Tmp Cleanup" (hourly), universal
+  scratch cleanup. In one pass:
+    1. Deletes ANY file in `tmp/` older than `-MaxAgeHours` (default 24),
+       regardless of name / extension. Recursive.
+    2. Sweeps `D:\` root for files matching scratch patterns (`tmp_*`,
+       `temp_*`, `_tmp*`, `_temp*`, `scratch_*`, `claude_*`, `mcp_*`,
+       `draft_*`, `out_*.txt`, `output_*.txt`, `chunk_*.txt`, `_part_*`,
+       `test_utf8.*`, `test_*.tmp`, `*.tmp`, `*.bak`, `*.old`, `*~`,
+       `*.scratch`) older than `-RootMaxAgeHours` (default 24).
+  Flags: `-DryRun`, `-SkipRoot`, `-MaxAgeHours N`, `-RootMaxAgeHours N`.
+  Add new patterns to `$RootPatterns` in the script when needed; protect
+  specific real files via `$RootExclude`. Logs to `logs/cleanup-tmp.log`.
 
 Process supervision:
 
@@ -38,6 +53,30 @@ Process supervision:
 
 **NO PM2 locally.** The `pm2_status` tool still works on remote hosts that
 DO use PM2 — that's fine, just not here.
+
+## Scratch files convention
+
+When you need to write an intermediate / throwaway file (a partial chunk
+buffer, a regex test, a `tmp_*` log, anything not a real project artifact),
+write it to:
+
+```
+D:\mcp-server\tmp\
+```
+
+NOT to `D:\` root, NOT to `D:\tmp\` (that's used by other tools), NOT to
+the project directory you're working on. Filename inside `tmp\` is free —
+use a task-scoped name like `D:\mcp-server\tmp\jwu_source.txt` or
+`D:\mcp-server\tmp\<task>_part.txt` for chunked writes.
+
+A scheduled task (`cleanup-tmp.ps1`, hourly) deletes anything in this
+directory older than 24h. You do NOT need to clean up after yourself —
+the system handles it. If you want to clean immediately, just call
+`local_exec` with `powershell -NoProfile -ExecutionPolicy Bypass -File D:\mcp-server\cleanup-tmp.ps1 -MaxAgeHours 0`.
+
+This replaces the older "D:/tmp_<task>_part.txt" pattern referenced in
+CLAUDE_PREFERENCES.md — that pattern produced scattered orphaned files
+at `D:\` root with no cleanup story.
 
 ## Verification per file type
 
@@ -143,6 +182,70 @@ The local AWS CLI profile (from `~/.aws/credentials` or env vars) must have
 
 To disable for one host: remove `security_group_id` from its hosts.json
 entry. To disable globally: don't set `security_group_id` on any host.
+
+## Persistent SSH connection pool (ssh2)
+
+Since 2026-05-21, `ssh_exec` (named-host path), `pm2_status`, and
+`postgres_query` no longer spawn a fresh `ssh` CLI per call. They route
+through an in-process pool of `ssh2.Client` instances kept in the
+`SSH_POOL` Map (one entry per `hostKey`).
+
+Why: Windows OpenSSH `ControlMaster` is broken (named-pipe stack), so the
+CLI can't multiplex. The pool replaces that with in-process persistence.
+First call: full SSH handshake (~500-700ms). Subsequent calls within
+`SSH_IDLE_TIMEOUT_SECONDS` (default 300s): ~100-200ms total.
+
+Key invariants:
+
+1. **Eviction**: a `setInterval` janitor closes entries idle for more than
+   `SSH_IDLE_TIMEOUT_SECONDS`. The interval is `.unref()`-ed so it doesn't
+   keep the process alive at shutdown.
+2. **Failure recovery**: `client.on('close')` and `client.on('error')`
+   delete the pool entry. Next `execSsh` call to that host reconnects.
+3. **Liveness probe**: `getSshClient` checks `client._sock.destroyed`
+   before reusing — caught dead sockets without paying for a roundtrip.
+4. **Cleanup**: `closeAllSshPool()` is wired into the PID-file cleanup
+   handler — runs on `SIGINT`, `SIGTERM`, and `process.on('exit')`.
+   Hard kills (taskkill /F, port-kill workaround) skip this — orphan
+   connections die from server-side keepalive within ~90s.
+5. **Concurrency**: if two callers race to create a connection for the
+   same host, the second one awaits the first's `connecting` promise
+   instead of opening a parallel session.
+
+`execSsh(hostKey, command, opts)` is the public helper. It mimics
+`execFileAsync`: throws on non-zero exit with `.stdout`, `.stderr`,
+`.code`, `.signal` attached to the error. Existing `try/catch` blocks
+work unchanged. Output is capped at `EXEC_BUFFER` (default 10MB); past
+that the `.truncated` flag is set and the remote stream is closed.
+
+Raw IP/DNS path of `ssh_exec` (host not in `hosts.json`) still uses the
+`ssh` CLI via `execFile` — we don't cache arbitrary IPs.
+
+`resolveKeyPath` and `buildSshArgs` were hoisted to module scope so the
+pool can call them. Don't push them back inside the registration block —
+they're shared module utilities now.
+
+`postgres_query` error output now includes `--- SQL ---` followed by the
+actual SQL (up to 1000 chars). Helps debug what the base64-wrapped
+remote command was actually trying to run.
+
+`sftp_download` and `sftp_upload` (added 2026-05-21) use the same pool:
+they call `withSftp(hostKey, fn)` which grabs the persistent ssh2 Client
+and opens a per-transfer SFTP channel via `client.sftp()`. The SFTP
+channel is closed when `fn` settles. Streaming-based — no in-memory
+buffering, so file size is not RAM-bound. The motivating use case is
+Claude.ai web sessions, where the cloud sandbox has no access to the
+local D:\ and no native `scp` — without these tools, file transfer to/
+from the VPS is impossible from web Claude.
+
+`restart-mcp.ps1` has a **known bug** as of 2026-05-21: its
+`Win32_Process` CommandLine filter pattern `mcp-server[\\/]server\.js`
+doesn't match the loop-spawned process whose CommandLine is just
+`node  server.js` (relative path, no `mcp-server\`). The script then
+reports "no MCP process found to stop" and tries to start fresh →
+EADDRINUSE on 4500 → exits 1. Workaround until fixed: kill by listening
+port. Fix would be to also match by listening on port 4500 or by parent
+process chain.
 
 ## OAuth / Express specifics
 

@@ -29,6 +29,7 @@ or keep as you like.
    .original) — mam git. NIE zapisuj pierwotnej wersji na dysk "na wszelki wypadek".
 
 NIGDY:
+
 - base64-chunki przez cmd.exe
 - helper scripty (`edit-X.js`, `transform-Y.js`) tylko po to żeby coś edytować
 - prośba żebyś ręcznie wkleił plik gdy write_file jest dostępny
@@ -47,6 +48,7 @@ ani "czy katalog istnieje". To są probesy, marnowanie tokenów. Jak komenda
 padnie z konkretnym błędem, wtedy diagnozuj.
 
 Weryfikacja po edycji per typ pliku:
+
 - .js → `node --check <plik>`. KONIEC.
 - .json → `node -e "JSON.parse(require('fs').readFileSync('<plik>','utf8'))"`. KONIEC.
 - .tsx, .astro, .md, .txt, .html, .css, .yml, .bat, .vbs, .sh → NIC. Trust the write.
@@ -95,6 +97,11 @@ Jeśli mam wątpliwość czy plik nie został zescapowany, szybki sanity check:
 
 # Anty-loop (twardo)
 
+- Liczenie problemu ≠ rozwiązywanie problemu. Jeśli łapiesz się na
+  "around 35 quotes to escape", "roughly 5 file writes needed",
+  "approximately 11KB total" — to są metryki strategii którą JESZCZE
+  NIE ZACZĄŁEŚ wykonywać. Wybierz strategię, wykonaj pierwszy krok,
+  liczy się tylko ile faktycznie zostało do zrobienia po tym kroku.
 - 3 nieudane tool calls na ten sam problem → STOP. Opisz prosa, daj 2-3
   alternatywy, czekaj na mój wybór.
 - 5+ tool calli BEZ widocznego postępu (nawet jeśli "działają") → STOP, plan B.
@@ -131,13 +138,14 @@ To NIE znaczy że plik jest popsuty. To znaczy że KOMENDA którą
 wywołałeś nieprawidłowo zdekodowała bajty UTF-8.
 
 DO CZYTANIA PLIKÓW Z POLSKIM TEKSTEM:
+
 - ZAWSZE: `powershell -NoProfile -Command "Get-Content -LiteralPath '<plik>' -Encoding UTF8"`
 - NIGDY: `type <plik>` w cmd.exe (bez chcp 65001), `Get-Content` bez -Encoding
 
 Jeśli w wyniku zobaczysz `�`, `Ä…`, `Ĺ‚` lub podobne sekwencje — to
 NIE wniosek że plik jest popsuty. To wniosek że źle go odczytałeś.
 Weryfikacja przez surowe bajty:
-  powershell -NoProfile -Command "[BitConverter]::ToString((Get-Content '<plik>' -Encoding Byte -TotalCount 200))"
+powershell -NoProfile -Command "[BitConverter]::ToString((Get-Content '<plik>' -Encoding Byte -TotalCount 200))"
 Sekwencje C5-82, C4-85, C4-99, C5-BA itd. = poprawny UTF-8 z polskimi.
 EF-BF-BD = naprawdę replacement character (rzadko).
 
@@ -162,6 +170,82 @@ Wybierz JEDNĄ w pierwszych 30 sekundach. NIE oscyluj.
    → POST /git/commits → PATCH /git/refs/heads/main
    NIE używaj Contents API PUT — wymaga base64 całej nowej zawartości.
 
+# Edycja istniejącego pliku >50KB (DECISION FIRST)
+
+`write_file` mode=overwrite ma HARD_LIMIT 50KB. NIE próbuj go obejść
+przez kreatywne workaroundy. Wybierz JEDNĄ z trzech ścieżek w ciągu
+30 sekund. Liczenie cudzysłowów, planowanie ile patchy, "let me
+reconsider" — to NIE jest praca, to oscylacja. Stop.
+
+## Decyzja: ile zmienia się treści?
+
+A) 1-5 surgical replacements, każdy <50 linii → READ-MODIFY-WRITE INLINE
+
+Jedno `local_exec` z PowerShell:
+$c = Get-Content -Raw -LiteralPath '<path>' -Encoding UTF8
+$c = $c.Replace('<old1>', '<new1>')
+$c = $c.Replace('<old2>', '<new2>')
+[System.IO.File]::WriteAllText('<path>', $c,
+(New-Object System.Text.UTF8Encoding $false))
+
+Old/new stringi w tutaj-stringach @'...'@ (literal, tylko ' → '').
+.Replace() jest literal — NIE regex, NIE escape special chars.
+Po każdym .Replace() opcjonalnie:
+if ($c -eq $prev) { throw "patch N didn't match" }
+żeby wykryć failed match zamiast cichego no-op.
+
+B) Zmiana >50% pliku lub pełny rewrite → CHUNKED WRITE
+
+write_file mode=overwrite z pierwszym ~30KB.
+write_file mode=append z kolejnymi ~30KB.
+Patrz sekcja "Chunkowanie długich outputów".
+
+C) Zmiana dodaje nowy tool/feature wymagający restartu procesu który
+zerwie obecny czat (MCP server, dev server z hot reload tej rozmowy)
+→ SPEC-THEN-FRESH-CHAT
+
+write_file do `<repo>/CHANGES_PLAN.md` z dokładnymi blokami
+old/new dla każdego patcha + uzasadnienie + restart procedure.
+Powiedz: "spec zapisany, zrestartuj X i otwórz nowy czat — wykonam
+wg planu". STOP. Nie próbuj edytować w obecnym czacie nawet jeśli
+"jeszcze działa" — nowe toole i tak nie będą widoczne.
+
+## Anty-patterns (NIGDY)
+
+- File-pair approach: pisanie `_patches/old_1.txt`, `_patches/new_1.txt`,
+  `apply.ps1` "żeby uniknąć escape'owania". To jest helper script.
+  Tutaj-stringi PowerShella załatwiają escape'y bez żadnych plików.
+- Base64 wrapper na patches "żeby uniknąć quoting". PowerShell tutaj-stringi.
+- Re-encoding całego pliku przez base64+stdin "żeby ominąć 50KB limit".
+  Limit jest dla overwrite, nie dla local_exec → bezpośredni zapis
+  przez .NET WriteAllText nie ma tego limitu.
+- "Najpierw zapiszę stary plik na dysk jako backup". Mam git.
+
+## Sygnały że jesteś w decision paralysis (STOP natychmiast)
+
+- 2+ razy "actually, let me reconsider" / "wait, a simpler approach"
+  / "hmm, on the other hand"
+- Liczysz ilość znaków do escape'owania w planowanej strategii
+- Generujesz drugą wersję planu zanim wykonałeś pierwszą
+- Rozważasz 3+ strategie dla TEJ SAMEJ operacji zapisu
+- 5+ tool calli bez zapisu na dysk docelowy
+
+Reakcja: wybierz A. Default jest A. Jeśli A nie pasuje (>5 patchy
+albo każdy patch >50 linii), wybierz B. C tylko gdy explicit restart
+risk dla obecnego czatu.
+
+## Push-back zamiast workaroundu
+
+Jeśli widzisz że zadanie wymaga rzeczy która zerwie obecną sesję
+(restart MCP, restart dev servera od którego zależy ta rozmowa,
+migracja DB w trakcie której nie odpowiadam) — PYTAJ ZANIM zaczniesz,
+nie po 10 nieudanych próbach obejścia.
+
+"Ta zmiana wymaga restartu X co zerwie nasz czat. Trzy opcje:
+(1) zrobię teraz, restart, kontynuujesz w nowym czacie.
+(2) zapiszę spec, zrobisz sam.
+(3) odłóżmy do końca sesji. Co wolisz?"
+
 # Edycja istniejącego pliku w repo
 
 Jeśli plik JEST lokalnie (D:\repo\) → git pull + local edit (PS) + git push.
@@ -177,11 +261,12 @@ Gdy w tool callu (write_file, local_exec, read, edit) podajesz ścieżkę
 Windows w argumencie JSON, NIGDY nie pisz single backslash przed literą.
 
 NIEPRAWIDŁOWE:
-  "path": "D:\temp_file.txt"        ← \t = TAB w JSON!
-  "path": "D:\new\thing.txt"         ← \n = LF, \t = TAB
-  "path": "D:\Users\Admin\..."        ← \U może być Unicode escape
+"path": "D:\temp_file.txt" ← \t = TAB w JSON!
+"path": "D:\new\thing.txt" ← \n = LF, \t = TAB
+"path": "D:\Users\Admin\..." ← \U może być Unicode escape
 
 ZAWSZE używaj jednego z:
+
 1. Forward slashes (Node.js i Windows oba akceptują):
    "path": "D:/temp_file.txt"
    "path": "D:/matury-online.pl/frontend/src/data/test-polski-meta.ts"
@@ -218,8 +303,11 @@ Domyślnie: jeśli WAHASZ SIĘ czy chunkować, CHUNKUJ. False positive
 to chwila dodatkowych appendów. False negative to utrata całej pracy.
 
 Strategia:
-1. Pierwszy chunk: write_file mode="overwrite" do PLIKU SCRATCH
-   (np. D:/tmp_<task>_part.txt). Szkielet + sekcja 1.
+
+1. Pierwszy chunk: write_file mode="overwrite" do PLIKU SCRATCH w
+   katalogu D:/mcp-server/tmp/ (np. D:/mcp-server/tmp/<task>_part.txt).
+   Szkielet + sekcja 1. NIE zapisuj scratchy do D:/ root — sprzątanie tam
+   nie istnieje, te pliki zostają wieczne.
 2. Kolejne: write_file mode="append" do tego samego pliku.
    Sekcja 2, 3, 4...
 3. Po każdym appendzie: jedna linia raportu, np. "chunk 3/7
@@ -248,8 +336,8 @@ mówi "padło w środku":
 
 1. NIE zaczynaj od zera. Sprawdź co JEST NA DYSKU:
    powershell -NoProfile -Command "if (Test-Path '<scratch>') {
-     Write-Host ('size: ' + (Get-Item '<scratch>').Length);
-     Get-Content '<scratch>' -Tail 10 -Encoding UTF8
+   Write-Host ('size: ' + (Get-Item '<scratch>').Length);
+   Get-Content '<scratch>' -Tail 10 -Encoding UTF8
    } else { Write-Host 'missing' }"
 
 2. Określ gdzie poprzedni write skończył (po ostatniej kompletnej
