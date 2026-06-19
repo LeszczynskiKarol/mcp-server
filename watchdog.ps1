@@ -27,8 +27,64 @@ function Test-McpAlive {
     return $null
 }
 
+function Test-McpTunnel {
+    # Probes https://mcp.torweb.pl/mcp. Returns:
+    #   $true  -> tunnel OK (got 401 — frps reached MCP, Bearer just missing)
+    #   $false -> tunnel broken (got 404 from frps, no proxy registered)
+    #   $null  -> network error / can't reach frps at all
+    try {
+        $r = Invoke-WebRequest -Uri 'https://mcp.torweb.pl/mcp' `
+            -Method Post `
+            -ContentType 'application/json' `
+            -Body '{"jsonrpc":"2.0","id":1,"method":"ping"}' `
+            -TimeoutSec 8 `
+            -UseBasicParsing `
+            -ErrorAction Stop
+        return $false  # 2xx without auth is unexpected, treat as broken
+    } catch {
+        $code = $null
+        try { $code = $_.Exception.Response.StatusCode.value__ } catch {}
+        if ($code -eq 401) { return $true }
+        if ($code -eq 404) { return $false }
+        return $null
+    }
+}
+
+function Restart-Frpc {
+    Write-Log "frpc tunnel broken (mcp.torweb.pl -> 404), restarting frpc.exe"
+    $frpcDir = 'C:\Users\Admin\frp\frp_0.61.1_windows_amd64'
+    $frpcExe = Join-Path $frpcDir 'frpc.exe'
+    if (-not (Test-Path $frpcExe)) {
+        Write-Log "ERROR: $frpcExe missing - cannot restart"
+        return $false
+    }
+    Get-Process -Name frpc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    try {
+        Start-Process -FilePath $frpcExe -ArgumentList '-c','frpc.toml' -WorkingDirectory $frpcDir -WindowStyle Hidden
+    } catch {
+        Write-Log "ERROR: frpc Start-Process failed: $_"
+        return $false
+    }
+    Start-Sleep -Seconds 3
+    $tunnelOk = Test-McpTunnel
+    if ($tunnelOk -eq $true) {
+        Write-Log "OK - frpc restarted, tunnel responding"
+        return $true
+    }
+    Write-Log "ERROR: frpc restarted but tunnel still not responding (Test-McpTunnel returned: $tunnelOk)"
+    return $false
+}
+
 if (Test-McpAlive) {
-    # Server is running, do nothing.
+    # Local server is running. Verify tunnel too — frpc can die independently
+    # of the MCP node process (as happened 2026-05-24: frpc.toml was missing
+    # the mcp proxy block, so tunnel returned 404 even though :4500 was alive,
+    # which caused 5 wasted Claude runs in claude-egzaminy).
+    $tunnel = Test-McpTunnel
+    if ($tunnel -eq $false) {
+        Restart-Frpc | Out-Null
+    }
     exit 0
 }
 

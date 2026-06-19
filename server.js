@@ -106,6 +106,12 @@ const PORT = parseInt(process.env.PORT || "4500", 10);
 const SERVER_NAME = process.env.MCP_SERVER_NAME || "mcp-server";
 const TOKEN_TTL_MS =
   parseInt(process.env.TOKEN_TTL_SECONDS || "2592000", 10) * 1000;
+// Access tokens are short-lived (default 24h); the 30-day TOKEN_TTL_MS above
+// now applies to refresh tokens only. A stolen access token grants local_exec
+// (full RCE) — limiting its lifetime caps that blast radius. Clients refresh
+// silently via the refresh_token grant, so this is invisible in normal use.
+const ACCESS_TOKEN_TTL_MS =
+  parseInt(process.env.ACCESS_TOKEN_TTL_SECONDS || "86400", 10) * 1000;
 const AUTH_CODE_TTL_MS =
   parseInt(process.env.AUTH_CODE_TTL_SECONDS || "600", 10) * 1000;
 const EXEC_BUFFER =
@@ -154,7 +160,9 @@ if (!GITHUB_TOKEN)
 console.log(`MCP server: ${SERVER_NAME}`);
 console.log(`Base URL: ${BASE_URL}`);
 console.log(`Port: ${PORT}`);
-console.log(`Token TTL: ${TOKEN_TTL_MS / 1000 / 86400} days`);
+console.log(
+  `Token TTL: access ${ACCESS_TOKEN_TTL_MS / 1000 / 3600}h, refresh ${TOKEN_TTL_MS / 1000 / 86400} days`,
+);
 console.log(
   `Static IP allowlist: ${ALLOWED_IPS.length ? ALLOWED_IPS.join(", ") : "(none)"}`,
 );
@@ -368,7 +376,8 @@ async function execSsh(hostKey, command, opts = {}) {
   return await new Promise((resolve, reject) => {
     let stdout = "";
     let stderr = "";
-    let truncated = false;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let stream;
     let timedOut = false;
 
@@ -390,18 +399,20 @@ async function execSsh(hostKey, command, opts = {}) {
       stream = s;
 
       s.on("data", (chunk) => {
-        if (truncated) return;
+        if (stdoutTruncated) return;
         if (stdout.length + chunk.length > maxBuffer) {
           stdout += chunk.toString("utf8").slice(0, maxBuffer - stdout.length);
-          truncated = true;
+          stdoutTruncated = true;
           try { s.close(); } catch {}
         } else {
           stdout += chunk.toString("utf8");
         }
       });
       s.stderr.on("data", (chunk) => {
+        if (stderrTruncated) return;
         if (stderr.length + chunk.length > maxBuffer) {
           stderr += chunk.toString("utf8").slice(0, maxBuffer - stderr.length);
+          stderrTruncated = true;
         } else {
           stderr += chunk.toString("utf8");
         }
@@ -424,7 +435,13 @@ async function execSsh(hostKey, command, opts = {}) {
           e.stderr = stderr;
           return reject(e);
         }
-        resolve({ stdout, stderr, code, signal, truncated });
+        resolve({
+          stdout,
+          stderr,
+          code,
+          signal,
+          truncated: stdoutTruncated || stderrTruncated,
+        });
       });
       s.on("error", (e) => {
         clearTimeout(timer);
@@ -1915,7 +1932,10 @@ if (TRUST_PROXY !== false) {
   app.set("trust proxy", TRUST_PROXY);
   console.log(`[trust proxy] set to: ${JSON.stringify(TRUST_PROXY)}`);
 }
-app.use(express.json({ limit: "50mb" }));
+// No global JSON body parser. Parsers are mounted per-route AFTER auth/
+// allowlist checks, so an unauthenticated client can't make us buffer and
+// parse megabytes of JSON. /mcp gets 4mb (largest legit payload is a
+// write_file append chunk, ~30KB); /oauth/register gets 50kb (DCR metadata).
 
 // Log all OAuth/MCP requests
 const SENSITIVE_KEYS = new Set([
@@ -1976,7 +1996,9 @@ app.use(
   }),
 );
 
-const mcpHandler = async (req, res) => {
+// Auth middleware for /mcp — runs BEFORE the JSON body parser so
+// unauthenticated requests are rejected without buffering their payload.
+const mcpAuth = (req, res, next) => {
   // IP allowlist gate — applies to /mcp only.
   // Returns 401 (not 403) with WWW-Authenticate so the OAuth client re-runs the
   // login flow, which will auto-enroll the new IP.
@@ -1999,6 +2021,12 @@ const mcpHandler = async (req, res) => {
     );
     return res.status(401).end();
   }
+  next();
+};
+
+const mcpJsonParser = express.json({ limit: "4mb" });
+
+const mcpHandler = async (req, res) => {
   const server = createMcpServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
@@ -2011,9 +2039,9 @@ const mcpHandler = async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 };
 
-app.post("/mcp", mcpHandler);
-app.get("/mcp", mcpHandler);
-app.delete("/mcp", mcpHandler);
+app.post("/mcp", mcpAuth, mcpJsonParser, mcpHandler);
+app.get("/mcp", mcpAuth, mcpHandler);
+app.delete("/mcp", mcpAuth, mcpHandler);
 
 // === OAuth 2.1 endpoints for MCP ===
 
@@ -2042,18 +2070,48 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
 });
 
 // Dynamic Client Registration - Claude registers itself here automatically
-app.post("/oauth/register", (req, res) => {
+app.post("/oauth/register", express.json({ limit: "50kb" }), (req, res) => {
   if (clients.size >= MAX_CLIENTS) {
     console.warn(
       `[oauth] register rejected: client registry full (${clients.size}/${MAX_CLIENTS})`,
     );
     return res.status(503).json({ error: "client_registry_full" });
   }
+  // RFC 7591: redirect_uris are required for the authorization_code grant and
+  // must be sane URLs. https only, except http://localhost for local testing.
+  const redirect_uris = req.body?.redirect_uris;
+  if (!Array.isArray(redirect_uris) || redirect_uris.length === 0) {
+    return res.status(400).json({
+      error: "invalid_redirect_uri",
+      error_description: "redirect_uris must be a non-empty array",
+    });
+  }
+  const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+  for (const uri of redirect_uris) {
+    let parsed;
+    try {
+      parsed = new URL(uri);
+    } catch {
+      return res.status(400).json({
+        error: "invalid_redirect_uri",
+        error_description: `not a valid URL: ${uri}`,
+      });
+    }
+    const httpsOk = parsed.protocol === "https:";
+    const localOk =
+      parsed.protocol === "http:" && LOCAL_HOSTS.has(parsed.hostname);
+    if (!httpsOk && !localOk) {
+      return res.status(400).json({
+        error: "invalid_redirect_uri",
+        error_description: `must be https:// (or http://localhost): ${uri}`,
+      });
+    }
+  }
   const client_id = crypto.randomBytes(16).toString("hex");
   const client_secret = crypto.randomBytes(32).toString("hex");
   clients.set(client_id, {
     client_secret,
-    redirect_uris: req.body.redirect_uris || [],
+    redirect_uris,
     token_endpoint_auth_method:
       req.body.token_endpoint_auth_method || "client_secret_post",
     created_at: Date.now(),
@@ -2063,7 +2121,7 @@ app.post("/oauth/register", (req, res) => {
   res.status(201).json({
     client_id,
     client_secret,
-    redirect_uris: req.body.redirect_uris,
+    redirect_uris,
     grant_types: ["authorization_code"],
     response_types: ["code"],
     token_endpoint_auth_method: "client_secret_post",
@@ -2092,6 +2150,17 @@ app.get("/oauth/authorize", (req, res) => {
       client.redirect_uris,
     );
     return res.status(400).send("Invalid redirect_uri");
+  }
+  // OAuth 2.1: PKCE is mandatory, S256 only. Reject up front so a client
+  // misconfiguration fails here with a readable error instead of at /oauth/token.
+  // (Enforced again at token exchange — hidden form fields can be stripped.)
+  if (!code_challenge || code_challenge_method !== "S256") {
+    console.log(
+      "  -> FAIL: PKCE required (code_challenge missing or method != S256)",
+    );
+    return res
+      .status(400)
+      .send("PKCE required: code_challenge with code_challenge_method=S256");
   }
   const esc = (s) =>
     String(s ?? "")
@@ -2242,7 +2311,7 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
     const new_rt = crypto.randomBytes(32).toString("hex");
     accessTokens.set(hashToken(new_at), {
       client_id,
-      expires: Date.now() + TOKEN_TTL_MS,
+      expires: Date.now() + ACCESS_TOKEN_TTL_MS,
     });
     refreshTokens.set(hashToken(new_rt), {
       client_id,
@@ -2253,7 +2322,7 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
     const refResp = {
       access_token: new_at,
       token_type: "Bearer",
-      expires_in: Math.floor(TOKEN_TTL_MS / 1000),
+      expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
       refresh_token: new_rt,
       scope: "mcp",
     };
@@ -2287,19 +2356,26 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
     return res.status(400).json({ error: "invalid_grant" });
   }
 
-  // PKCE verify - S256 only
-  if (codeData.code_challenge) {
-    if (codeData.code_challenge_method !== "S256") {
-      console.log(
-        "  -> FAIL: PKCE method not S256:",
-        codeData.code_challenge_method,
-      );
-      return res.status(400).json({ error: "invalid_grant" });
-    }
-    if (!code_verifier) {
-      console.log("  -> FAIL: missing code_verifier");
-      return res.status(400).json({ error: "invalid_grant" });
-    }
+  // PKCE verify — mandatory per OAuth 2.1, S256 only. A code issued without
+  // a challenge (e.g. hidden form fields stripped on POST /authorize) is
+  // unusable; no silent downgrade to plain authorization_code.
+  if (!codeData.code_challenge) {
+    console.log("  -> FAIL: code issued without PKCE challenge — rejected");
+    authCodes.delete(code);
+    return res.status(400).json({ error: "invalid_grant" });
+  }
+  if (codeData.code_challenge_method !== "S256") {
+    console.log(
+      "  -> FAIL: PKCE method not S256:",
+      codeData.code_challenge_method,
+    );
+    return res.status(400).json({ error: "invalid_grant" });
+  }
+  if (!code_verifier) {
+    console.log("  -> FAIL: missing code_verifier");
+    return res.status(400).json({ error: "invalid_grant" });
+  }
+  {
     const challenge = crypto
       .createHash("sha256")
       .update(code_verifier)
@@ -2322,11 +2398,11 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
   const refresh_token = crypto.randomBytes(32).toString("hex");
   accessTokens.set(hashToken(access_token), {
     client_id,
-    expires: Date.now() + TOKEN_TTL_MS, // 30 days by default
+    expires: Date.now() + ACCESS_TOKEN_TTL_MS, // 24h by default
   });
   refreshTokens.set(hashToken(refresh_token), {
     client_id,
-    expires: Date.now() + TOKEN_TTL_MS,
+    expires: Date.now() + TOKEN_TTL_MS, // 30 days by default
   });
   enrollIp(req, "token_exchange");
   saveOauthState();
@@ -2334,7 +2410,7 @@ app.post("/oauth/token", express.urlencoded({ extended: true }), (req, res) => {
   const response = {
     access_token,
     token_type: "Bearer",
-    expires_in: Math.floor(TOKEN_TTL_MS / 1000),
+    expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
     refresh_token,
     scope: "mcp",
   };

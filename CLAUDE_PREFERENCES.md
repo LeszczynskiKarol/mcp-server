@@ -18,7 +18,30 @@ Adapt language settings and absolute paths to your own setup.
 - Be concise. No "I'll be happy to help with that!" or "Great question!"
   preambles. No emoji unless I use them first.
 
-# File-tool hierarchy (when working under D:\ in any repo)
+# Execution context (read before the file/MCP rules below)
+
+These preferences are written **WEB-first** — i.e. for Claude.ai, whose cloud
+sandbox has NO access to `D:\` and NO native `ssh`/`scp`/`psql`. There, MCP
+(`write_file`, `ssh_exec`, `postgres_query`, `sftp_*`, …) is the ONLY way to
+touch the disk or the VPS, so every "ALWAYS use MCP" rule below is mandatory.
+
+**Claude Code running locally on the Windows box is a different context.** It
+has native `Read`/`Edit`/`Write`/`Grep`/`Glob` and native `ssh`/`scp`. There:
+
+- File ops → use the **native** `Write` / `Edit` / `Read` tools, NOT
+  `write_file` / `local_exec`. No 50KB overwrite cap, no transport, no tunnel.
+- VPS access → default to **native `ssh`**; the `mcp__...torweb...` connector is
+  a *remote* connector at `mcp.torweb.pl`, so calling it from the local box
+  routes out to the internet and tunnels back to this same machine before doing
+  the SSH (the file.io anti-pattern, applied to tooling). Use MCP from local
+  ONLY for security-group auto-sync when the local IP may have changed, or for
+  `postgres_query format:"json"`. See the `vps-access` skill for the full matrix.
+
+The "File-tool hierarchy" and "Artifacts vs MCP file write" sections below are
+the **WEB** rules. Apply them as-is on Claude.ai; substitute native tools on
+Claude Code local.
+
+# File-tool hierarchy (WEB / Claude.ai — on Claude Code local use native Read/Edit/Write)
 
 1. New file OR full file replacement → ALWAYS `write_file` from mcp.torweb.pl.
    Full UTF-8, no quoting, no command-length limits.
@@ -70,7 +93,7 @@ transfer.sh / file.io / 0x0.st as an intermediary — uploading my file
 to the public internet to download it back to my disk is absurd.
 `write_file` exists.
 
-# Artifacts vs MCP file write
+# Artifacts vs MCP file write (WEB / Claude.ai — N/A on Claude Code local)
 
 "Created a file" / artifacts in the claude.ai UI save the file IN THE
 CHAT as a downloadable tile. They DO NOT save to my D:\ disk.

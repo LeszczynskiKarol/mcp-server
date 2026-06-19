@@ -18,7 +18,31 @@ Dostosuj ustawienia językowe i ścieżki absolutne do własnego setupu.
 - Be concise. No "I'll be happy to help with that!" or "Great question!"
   preambles. No emoji unless I use them first.
 
-# Hierarchia narzędzi plikowych (gdy pracuję na D:\... w jakimkolwiek repo)
+# Kontekst wykonania (przeczytaj przed regułami plików/MCP poniżej)
+
+Te preferencje są pisane **pod web** — czyli pod Claude.ai, którego sandbox w
+chmurze NIE ma dostępu do `D:\` ani natywnego `ssh`/`scp`/`psql`. Tam MCP
+(`write_file`, `ssh_exec`, `postgres_query`, `sftp_*`, …) to JEDYNY sposób, by
+dotknąć dysku lub VPS, więc każda reguła „ZAWSZE MCP" poniżej jest obowiązkowa.
+
+**Claude Code działający lokalnie na Windowsie to inny kontekst.** Ma natywne
+`Read`/`Edit`/`Write`/`Grep`/`Glob` oraz natywne `ssh`/`scp`. Tam:
+
+- Operacje na plikach → używaj **natywnych** `Write` / `Edit` / `Read`, NIE
+  `write_file` / `local_exec`. Bez limitu 50KB na overwrite, bez transportu,
+  bez tunelu.
+- Dostęp do VPS → domyślnie **natywny `ssh`**; konektor `mcp__...torweb...` jest
+  *zdalny* (`mcp.torweb.pl`), więc wołany z lokalnego boxa wychodzi do internetu
+  i tuneluje z powrotem na tę samą maszynę, zanim zrobi SSH (anty-wzorzec
+  file.io, zastosowany do narzędzi). Z lokalnego używaj MCP TYLKO do auto-syncu
+  security group, gdy lokalny IP mógł się zmienić, albo dla
+  `postgres_query format:"json"`. Pełna matryca w skillu `vps-access`.
+
+Sekcje „Hierarchia narzędzi plikowych" i „Artifacts vs MCP file write" poniżej
+to reguły **web**. Na Claude.ai stosuj je wprost; na Claude Code lokalnie
+podstaw narzędzia natywne.
+
+# Hierarchia narzędzi plikowych (web / Claude.ai — na Claude Code lokalnie użyj natywnych Read/Edit/Write)
 
 1. Nowy plik LUB pełne zastąpienie pliku → ZAWSZE `write_file` z mcp.torweb.pl.
    Pełne UTF-8, bez quoting, bez limitów długości komendy.
@@ -69,7 +93,7 @@ plików do sandboxa "żeby edytować". Nie używaj uguu.se / transfer.sh / file.
 / 0x0.st jako pośrednika — upload mojego pliku do publicznego internetu
 żeby go ściągnąć z powrotem na mój dysk to absurd. `write_file` istnieje.
 
-# Artifacts vs MCP file write
+# Artifacts vs MCP file write (web / Claude.ai — N/D na Claude Code lokalnie)
 
 "Created a file" / artifacts w UI claude.ai zapisują plik W CZACIE jako
 pobieralną kafelkę. NIE zapisują na moim dysku D:\.

@@ -238,19 +238,44 @@ Claude.ai web sessions, where the cloud sandbox has no access to the
 local D:\ and no native `scp` — without these tools, file transfer to/
 from the VPS is impossible from web Claude.
 
-`restart-mcp.ps1` has a **known bug** as of 2026-05-21: its
-`Win32_Process` CommandLine filter pattern `mcp-server[\\/]server\.js`
-doesn't match the loop-spawned process whose CommandLine is just
-`node  server.js` (relative path, no `mcp-server\`). The script then
-reports "no MCP process found to stop" and tries to start fresh →
-EADDRINUSE on 4500 → exits 1. Workaround until fixed: kill by listening
-port. Fix would be to also match by listening on port 4500 or by parent
-process chain.
+`restart-mcp.ps1` CommandLine-filter bug is FIXED (commit `81a0ba3`):
+Path 3 finds the MCP node by listening port 4500 + parent-chain check,
+and a `.respawn.lock` file coordinates with the watchdog.
+
+**Remaining trap — elevation** (discovered 2026-06-10): if the
+"MCP Server" scheduled task runs with "highest privileges", the node
+process is high-integrity. A non-elevated shell sees an EMPTY WMI
+CommandLine for it (every filter in restart-mcp.ps1 silently fails) and
+gets access denied on Stop-Process; `schtasks /End` kills only the
+long-dead wscript, not the cmd→node tree. Symptom: restart-mcp prints
+"does not look like our MCP - refusing to kill" then falsely reports
+"OK - respawned" with the SAME old PID. Recovery: UAC-elevated
+`Stop-Process`, then start fresh non-elevated. Permanent fix: set the
+task RunLevel to Limited (server needs no admin rights) — elevated PS:
+`$t = Get-ScheduledTask "MCP Server"; $t.Principal.RunLevel = "Limited"; Set-ScheduledTask $t`.
 
 ## OAuth / Express specifics
 
 - Tokens stored sha256-hashed. The migration code in `loadOauthState`
   auto-converts legacy plaintext entries on load — don't break it.
+- Token TTLs are SPLIT (since 2026-06-10): access tokens live
+  `ACCESS_TOKEN_TTL_SECONDS` (default 24h), refresh tokens live
+  `TOKEN_TTL_SECONDS` (default 30 days). Don't merge them back — a stolen
+  access token grants `local_exec` (full RCE), short life caps the blast
+  radius. Clients refresh silently via the refresh_token grant.
+- PKCE (S256) is MANDATORY — enforced at GET /oauth/authorize AND at
+  /oauth/token. No fallback to plain authorization_code. Claude.ai always
+  sends PKCE, so this never fires in normal use.
+- No global JSON body parser. `express.json` is mounted per-route AFTER
+  auth: /mcp gets 4mb behind `mcpAuth`, /oauth/register gets 50kb. Don't
+  re-add a global `app.use(express.json(...))` — it let unauthenticated
+  clients buffer 50MB bodies.
+- /oauth/register validates `redirect_uris`: non-empty array, https://
+  only (http:// allowed for localhost). Rejects with RFC 7591
+  `invalid_redirect_uri`.
+- `start-mcp.bat` rotates `logs/mcp.log` (>20MB → .1 → .2) at each loop
+  iteration — i.e. on every respawn/restart, not mid-run (the >> handle
+  is held while node runs).
 - CSRF is HMAC-signed, stateless. `CSRF_SECRET` is regenerated at boot, so
   login forms opened during a restart will fail submit with "Invalid or
   expired form token". That's intentional, not a bug.
