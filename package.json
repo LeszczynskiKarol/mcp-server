@@ -44,11 +44,11 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "dotenv": "^17.0.0",
     "express": "^4.21.0",
-    "express-rate-limit": "^8.5.2",
-    "helmet": "^8.1.0",
+    "express-rate-limit": "^8.7.5",
+    "helmet": "^8.3.0",
     "ssh2": "^1.17.0",
     "zod": "^3.24.0"
   },
